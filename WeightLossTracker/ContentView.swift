@@ -2,6 +2,8 @@ import SwiftUI
 import UIKit
 import Combine
 import UserNotifications
+import AVFoundation
+import AudioToolbox
 
 // MARK: - Models
 
@@ -136,9 +138,17 @@ struct Roadmap: Codable {
     var startWaist: Double
     var plan: RoadmapPlan
 
-    var currentWeek: Int {
-        max(1, Int(Date().timeIntervalSince(createdAt) / 604_800) + 1)
+    /// Plan weeks run Sunday–Saturday; week 1 is the calendar week the plan was created in.
+    func weekStart(_ week: Int) -> Date {
+        Calendar.current.date(byAdding: .day, value: (week - 1) * 7, to: sundayOnOrBefore(createdAt)) ?? createdAt
     }
+
+    func currentWeek(at date: Date = Date()) -> Int {
+        let days = Calendar.current.dateComponents([.day], from: sundayOnOrBefore(createdAt), to: sundayOnOrBefore(date)).day ?? 0
+        return max(1, days / 7 + 1)
+    }
+
+    var currentWeek: Int { currentWeek() }
 }
 
 struct ChartPoint: Identifiable {
@@ -246,6 +256,21 @@ class Store: ObservableObject {
         }
         logs.removeAll { $0.id == log.id }
         persist(logs, logsKey)
+    }
+
+    /// Average of weight logs over a 7-day window ending `daysBack` days before today (0 = today and the 6 days before).
+    func averageWeightKg(daysBack: Int) -> (kg: Double, count: Int)? {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        guard let end = cal.date(byAdding: .day, value: 1 - daysBack, to: today),
+              let start = cal.date(byAdding: .day, value: -7, to: end) else { return nil }
+        return averageWeightKg(from: start, to: end)
+    }
+
+    func averageWeightKg(from start: Date, to end: Date) -> (kg: Double, count: Int)? {
+        let window = logs.filter { $0.date >= start && $0.date < end }
+        guard !window.isEmpty else { return nil }
+        return (window.reduce(0) { $0 + $1.weightKg } / Double(window.count), window.count)
     }
 
     func image(for fileName: String?) -> UIImage? {
@@ -550,8 +575,6 @@ struct WeightView: View {
     @State private var weightInput = ""
     @State private var selectedImage: UIImage?
     @State private var showSourcePicker = false
-    @State private var showImagePicker = false
-    @State private var imagePickerSource: UIImagePickerController.SourceType = .photoLibrary
     @State private var waistInput = ""
     @State private var waistSunday = sundayOnOrBefore(Date())
     @AppStorage("roadmapLengthUnit") private var lengthUnitRaw = ""
@@ -634,22 +657,7 @@ struct WeightView: View {
             .onChange(of: store.waist.map(\.date)) { _, _ in
                 Task { await rescheduleReminders() }
             }
-            .confirmationDialog("Photo", isPresented: $showSourcePicker, titleVisibility: .visible) {
-                if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                    Button("Take Photo") {
-                        imagePickerSource = .camera
-                        showImagePicker = true
-                    }
-                }
-                Button("Photo Library") {
-                    imagePickerSource = .photoLibrary
-                    showImagePicker = true
-                }
-                Button("Cancel", role: .cancel) {}
-            }
-            .sheet(isPresented: $showImagePicker) {
-                ImagePicker(image: $selectedImage, sourceType: imagePickerSource)
-            }
+            .photoSourcePicker(title: "Photo", isPresented: $showSourcePicker, image: $selectedImage)
         }
     }
 
@@ -671,7 +679,48 @@ struct WeightView: View {
                 StatTile(title: "Change", value: changeText, icon: "arrow.down.right")
                 StatTile(title: "Logs", value: "\(store.logs.count)", icon: "calendar")
             }
+
+            weeklyAverageRow
         }
+    }
+
+    private var weeklyAverageRow: some View {
+        let thisWeek = store.averageWeightKg(daysBack: 0)
+        let lastWeek = store.averageWeightKg(daysBack: 7)
+
+        return HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "chart.bar.xaxis")
+                .font(.headline)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("7-Day Average")
+                    .font(.caption.weight(.semibold))
+                    .opacity(0.85)
+                if let thisWeek {
+                    Text("\(thisWeek.count) \(thisWeek.count == 1 ? "entry" : "entries") in the past 7 days")
+                        .font(.caption2)
+                        .opacity(0.75)
+                } else {
+                    Text("Log a weight this week to see it")
+                        .font(.caption2)
+                        .opacity(0.75)
+                }
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(thisWeek.map { "\(store.display(weightKg: $0.kg)) \(store.unit.title)" } ?? "--")
+                    .font(.title3.weight(.heavy))
+                if let thisWeek, let lastWeek {
+                    Text(String(format: "%+.1f vs last week", store.convert(thisWeek.kg - lastWeek.kg)))
+                        .font(.caption2.weight(.semibold))
+                        .opacity(0.85)
+                }
+            }
+        }
+        .lineLimit(1)
+        .minimumScaleFactor(0.7)
+        .foregroundStyle(.white)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.white.opacity(0.18)))
     }
 
     private var changeText: String {
@@ -1268,6 +1317,8 @@ struct RoadMapView: View {
     @State private var isLoading = false
     @State private var errorText: String?
     @State private var showForm = true
+    @State private var now = Date()
+    @Environment(\.scenePhase) private var scenePhase
 
     @AppStorage("roadmapWeightUnit") private var weightUnitRaw = ""
     @AppStorage("roadmapLengthUnit") private var lengthUnitRaw = ""
@@ -1353,6 +1404,7 @@ struct RoadMapView: View {
                         planHero(roadmap)
                         unitsBar
                         planChart(roadmap)
+                        currentWeightChart(roadmap)
                         weeklyTable(roadmap)
                         tipsCard(roadmap)
                     } else {
@@ -1382,7 +1434,14 @@ struct RoadMapView: View {
             .tint(Theme.roadmapColor)
             .onAppear {
                 if store.roadmap != nil { showForm = false }
+                now = Date()
                 prefill()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { now = Date() }
+            }
+            .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { date in
+                if !Calendar.current.isDate(date, inSameDayAs: now) { now = date }
             }
         }
     }
@@ -1502,7 +1561,7 @@ struct RoadMapView: View {
     private func planHero(_ roadmap: Roadmap) -> some View {
         HeroCard(gradient: Theme.roadmap) {
             HStack {
-                Text("Goal · Week \(min(roadmap.currentWeek, roadmap.plan.totalWeeks)) of \(roadmap.plan.totalWeeks)")
+                Text("Goal · Week \(min(roadmap.currentWeek(at: now), roadmap.plan.totalWeeks)) of \(roadmap.plan.totalWeeks)")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.85))
                 Spacer()
@@ -1526,7 +1585,7 @@ struct RoadMapView: View {
             }
             .foregroundStyle(.white)
 
-            ProgressView(value: Double(min(roadmap.currentWeek, roadmap.plan.totalWeeks)), total: Double(max(roadmap.plan.totalWeeks, 1)))
+            ProgressView(value: Double(min(roadmap.currentWeek(at: now), roadmap.plan.totalWeeks)), total: Double(max(roadmap.plan.totalWeeks, 1)))
                 .tint(.white)
 
             HStack(spacing: 10) {
@@ -1559,15 +1618,80 @@ struct RoadMapView: View {
         .card()
     }
 
+    /// Your average logged weight for each plan week (Sunday–Saturday) up to the current week, in the selected unit.
+    private func actualWeekly(_ roadmap: Roadmap) -> [Int: Double] {
+        let cal = Calendar.current
+        var result: [Int: Double] = [:]
+        for m in roadmap.plan.milestones where m.week <= roadmap.currentWeek(at: now) {
+            let from = roadmap.weekStart(m.week)
+            guard let to = cal.date(byAdding: .day, value: 7, to: from),
+                  let avg = store.averageWeightKg(from: from, to: to) else { continue }
+            result[m.week] = convertWeight(avg.kg, from: "kg", to: weightUnit)
+        }
+        return result
+    }
+
+    private func currentWeightChart(_ roadmap: Roadmap) -> some View {
+        let actual = actualWeekly(roadmap)
+        let targets = roadmap.plan.milestones.map { convertWeight($0.weight, from: roadmap.weightUnit, to: weightUnit) }
+        let series = roadmap.plan.milestones.map { actual[$0.week] }
+        let latest = roadmap.plan.milestones.last { actual[$0.week] != nil }
+
+        return VStack(alignment: .leading, spacing: 12) {
+            SectionTitle(title: "Current Weight (\(weightUnit))", icon: "scalemass.fill", color: Theme.weightColor)
+
+            if actual.isEmpty {
+                EmptyHint(icon: "scalemass", text: "Log your weight in the Weight tab. Your weekly averages will be charted against the plan here.")
+            } else {
+                ProgressChart(target: targets, actual: series, currentIndex: min(roadmap.currentWeek(at: now), targets.count) - 1,
+                              targetColor: Theme.roadmapColor, actualColor: Theme.weightColor)
+                    .frame(height: 180)
+
+                HStack(spacing: 14) {
+                    legendItem(color: Theme.weightColor, dashed: false, text: "Your weekly average")
+                    legendItem(color: Theme.roadmapColor, dashed: true, text: "Target")
+                    Spacer()
+                }
+
+                if let latest, let value = actual[latest.week] {
+                    let target = convertWeight(latest.weight, from: roadmap.weightUnit, to: weightUnit)
+                    let diff = value - target
+                    Label(diff <= 0
+                          ? String(format: "Week %d: %.1f %@ ahead of target", latest.week, -diff, weightUnit)
+                          : String(format: "Week %d: %.1f %@ behind target", latest.week, diff, weightUnit),
+                          systemImage: diff <= 0 ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(diff <= 0 ? .green : .orange)
+                }
+            }
+        }
+        .card()
+    }
+
+    private func legendItem(color: Color, dashed: Bool, text: String) -> some View {
+        HStack(spacing: 6) {
+            Path { path in
+                path.move(to: CGPoint(x: 0, y: 1.5))
+                path.addLine(to: CGPoint(x: 18, y: 1.5))
+            }
+            .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round, dash: dashed ? [4, 3] : []))
+            .frame(width: 18, height: 3)
+            Text(text).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
     private func weeklyTable(_ roadmap: Roadmap) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let actual = actualWeekly(roadmap)
+
+        return VStack(alignment: .leading, spacing: 10) {
             SectionTitle(title: "Weekly Targets", icon: "calendar", color: Theme.roadmapColor)
 
             HStack(spacing: 6) {
-                Text("Wk").frame(width: 36, alignment: .leading)
-                unitHeader("Weight", unit: weightUnit) {
+                Text("Wk").frame(width: 30, alignment: .leading)
+                unitHeader("Target", unit: weightUnit) {
                     weightUnitBinding.wrappedValue = weightUnit == "lbs" ? "kg" : "lbs"
                 }
+                Text("Current").lineLimit(1).minimumScaleFactor(0.7).frame(maxWidth: .infinity, alignment: .leading)
                 Text("Fat %").lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                 unitHeader("Waist", unit: lengthUnit) {
                     lengthUnitBinding.wrappedValue = lengthUnit == "in" ? "cm" : "in"
@@ -1577,13 +1701,24 @@ struct RoadMapView: View {
             .foregroundStyle(.secondary)
 
             ForEach(roadmap.plan.milestones) { m in
-                let isCurrent = m.week == roadmap.currentWeek
+                let isCurrent = m.week == roadmap.currentWeek(at: now)
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
+                        let target = convertWeight(m.weight, from: roadmap.weightUnit, to: weightUnit)
                         Text("\(m.week)")
                             .font(.subheadline.weight(.heavy))
-                            .frame(width: 36, alignment: .leading)
-                        Text(String(format: "%.1f", convertWeight(m.weight, from: roadmap.weightUnit, to: weightUnit))).frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(width: 30, alignment: .leading)
+                        Text(String(format: "%.1f", target)).frame(maxWidth: .infinity, alignment: .leading)
+                        Group {
+                            if let current = actual[m.week] {
+                                Text(String(format: "%.1f", current))
+                                    .fontWeight(.bold)
+                                    .foregroundStyle(current <= target ? .green : .orange)
+                            } else {
+                                Text("—").foregroundStyle(.tertiary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         Text(String(format: "%.1f%%", m.bodyFat)).frame(maxWidth: .infinity, alignment: .leading)
                         Text(String(format: "%.1f", convertLength(m.waist, from: roadmap.waistUnit, to: lengthUnit))).frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -1607,7 +1742,7 @@ struct RoadMapView: View {
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         }
-                        .padding(.leading, 42)
+                        .padding(.leading, 36)
                     }
                 }
                 .padding(.vertical, 8)
@@ -1762,8 +1897,6 @@ struct MrOlympiaView: View {
     @State private var isLoading = false
     @State private var selectedImage: UIImage?
     @State private var showSourcePicker = false
-    @State private var showImagePicker = false
-    @State private var imagePickerSource: UIImagePickerController.SourceType = .photoLibrary
 
     private let suggestions = [
         "Rate my physique and what to improve",
@@ -1828,22 +1961,7 @@ struct MrOlympiaView: View {
             }
             .tint(Theme.olympiaColor)
             .onAppear { keyInput = apiKey }
-            .confirmationDialog("Attach a photo", isPresented: $showSourcePicker, titleVisibility: .visible) {
-                if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                    Button("Take Photo") {
-                        imagePickerSource = .camera
-                        showImagePicker = true
-                    }
-                }
-                Button("Photo Library") {
-                    imagePickerSource = .photoLibrary
-                    showImagePicker = true
-                }
-                Button("Cancel", role: .cancel) {}
-            }
-            .sheet(isPresented: $showImagePicker) {
-                ImagePicker(image: $selectedImage, sourceType: imagePickerSource)
-            }
+            .photoSourcePicker(title: "Attach a photo", isPresented: $showSourcePicker, image: $selectedImage)
         }
     }
 
@@ -2286,6 +2404,408 @@ struct LineChart: View {
                 }
             }
         }
+    }
+}
+
+/// Target line (dashed) with actual values (solid) on the same week axis; `actual` may have gaps.
+struct ProgressChart: View {
+    let target: [Double]
+    let actual: [Double?]
+    let currentIndex: Int
+    let targetColor: Color
+    let actualColor: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let height = geo.size.height - 16
+            let all = target + actual.compactMap { $0 }
+            let minV = all.min() ?? 0
+            let maxV = all.max() ?? 0
+            let pad = max(1.0, maxV - minV) * 0.15
+            let yMin = minV - pad
+            let yRange = (maxV + pad) - yMin
+            let stepX = width / CGFloat(max(target.count - 1, 1))
+            let point = { (i: Int, v: Double) in CGPoint(x: CGFloat(i) * stepX, y: 8 + height - ((v - yMin) / yRange) * height) }
+            let targetPts = target.enumerated().map { point($0.offset, $0.element) }
+            let actualPts = actual.enumerated().compactMap { i, v in v.map { point(i, $0) } }
+
+            ZStack {
+                ForEach(0..<4) { i in
+                    Path { path in
+                        let y = 8 + height * CGFloat(i) / 3
+                        path.move(to: CGPoint(x: 0, y: y))
+                        path.addLine(to: CGPoint(x: width, y: y))
+                    }
+                    .stroke(Color.secondary.opacity(0.15), style: StrokeStyle(lineWidth: 1, dash: [4]))
+                }
+
+                if currentIndex >= 0 {
+                    Path { path in
+                        let x = CGFloat(currentIndex) * stepX
+                        path.move(to: CGPoint(x: x, y: 0))
+                        path.addLine(to: CGPoint(x: x, y: geo.size.height))
+                    }
+                    .stroke(actualColor.opacity(0.25), lineWidth: 1.5)
+                }
+
+                Path { path in
+                    guard let first = targetPts.first else { return }
+                    path.move(to: first)
+                    targetPts.dropFirst().forEach { path.addLine(to: $0) }
+                }
+                .stroke(targetColor.opacity(0.7), style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [5, 4]))
+
+                Path { path in
+                    guard let first = actualPts.first, let last = actualPts.last else { return }
+                    path.move(to: CGPoint(x: first.x, y: geo.size.height))
+                    actualPts.forEach { path.addLine(to: $0) }
+                    path.addLine(to: CGPoint(x: last.x, y: geo.size.height))
+                    path.closeSubpath()
+                }
+                .fill(LinearGradient(colors: [actualColor.opacity(0.3), actualColor.opacity(0.02)], startPoint: .top, endPoint: .bottom))
+
+                Path { path in
+                    guard let first = actualPts.first else { return }
+                    path.move(to: first)
+                    actualPts.dropFirst().forEach { path.addLine(to: $0) }
+                }
+                .stroke(actualColor, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+
+                ForEach(Array(actualPts.enumerated()), id: \.offset) { index, p in
+                    Circle()
+                        .fill(.white)
+                        .overlay(Circle().stroke(actualColor, lineWidth: 2.5))
+                        .frame(width: index == actualPts.count - 1 ? 12 : 8, height: index == actualPts.count - 1 ? 12 : 8)
+                        .position(p)
+                }
+
+                VStack {
+                    HStack {
+                        Spacer()
+                        Text(String(format: "%.1f", maxV)).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Text(String(format: "%.1f", minV)).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Photo Source + Timer Camera
+
+struct PhotoSourcePicker: ViewModifier {
+    let title: String
+    @Binding var isPresented: Bool
+    @Binding var image: UIImage?
+    @State private var showLibrary = false
+    @State private var showCamera = false
+
+    func body(content: Content) -> some View {
+        content
+            .confirmationDialog(title, isPresented: $isPresented, titleVisibility: .visible) {
+                if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                    Button("Take Photo") { showCamera = true }
+                }
+                Button("Photo Library") { showLibrary = true }
+                Button("Cancel", role: .cancel) {}
+            }
+            .sheet(isPresented: $showLibrary) {
+                ImagePicker(image: $image, sourceType: .photoLibrary)
+            }
+            .fullScreenCover(isPresented: $showCamera) {
+                TimerCameraView(image: $image)
+            }
+    }
+}
+
+extension View {
+    func photoSourcePicker(title: String, isPresented: Binding<Bool>, image: Binding<UIImage?>) -> some View {
+        modifier(PhotoSourcePicker(title: title, isPresented: isPresented, image: image))
+    }
+}
+
+final class CameraController: NSObject, ObservableObject {
+    let session = AVCaptureSession()
+    @Published var position: AVCaptureDevice.Position = .front
+    @Published var permissionDenied = false
+    private let output = AVCapturePhotoOutput()
+    private let queue = DispatchQueue(label: "wlt.camera.session")
+    private var photoDelegate: PhotoCaptureDelegate?
+
+    func start() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configure()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                DispatchQueue.main.async {
+                    if granted { self.configure() } else { self.permissionDenied = true }
+                }
+            }
+        default:
+            permissionDenied = true
+        }
+    }
+
+    func stop() {
+        let session = session
+        queue.async { session.stopRunning() }
+    }
+
+    func flip() {
+        position = position == .front ? .back : .front
+        configure()
+    }
+
+    private func configure() {
+        let session = session, output = output, position = position
+        queue.async {
+            session.beginConfiguration()
+            session.sessionPreset = .photo
+            session.inputs.forEach { session.removeInput($0) }
+            if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
+               let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) {
+                session.addInput(input)
+            }
+            if !session.outputs.contains(output), session.canAddOutput(output) {
+                session.addOutput(output)
+            }
+            session.commitConfiguration()
+            if !session.isRunning { session.startRunning() }
+        }
+    }
+
+    func capture(_ completion: @escaping (UIImage?) -> Void) {
+        if let connection = output.connection(with: .video) {
+            if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle = 90 }
+            if connection.isVideoMirroringSupported {
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = position == .front
+            }
+        }
+        let delegate = PhotoCaptureDelegate { image in
+            DispatchQueue.main.async {
+                completion(image)
+                self.photoDelegate = nil
+            }
+        }
+        photoDelegate = delegate
+        output.capturePhoto(with: AVCapturePhotoSettings(), delegate: delegate)
+    }
+}
+
+nonisolated final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
+    private let completion: @Sendable (UIImage?) -> Void
+
+    init(completion: @escaping @Sendable (UIImage?) -> Void) {
+        self.completion = completion
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        completion(photo.fileDataRepresentation().flatMap { UIImage(data: $0) })
+    }
+}
+
+struct CameraPreview: UIViewRepresentable {
+    let session: AVCaptureSession
+
+    final class PreviewView: UIView {
+        override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+        var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+    }
+
+    func makeUIView(context: Context) -> PreviewView {
+        let view = PreviewView()
+        view.previewLayer.session = session
+        view.previewLayer.videoGravity = .resizeAspectFill
+        return view
+    }
+
+    func updateUIView(_ uiView: PreviewView, context: Context) {}
+}
+
+struct TimerCameraView: View {
+    @Binding var image: UIImage?
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var camera = CameraController()
+    @AppStorage("cameraTimerSeconds") private var timerSeconds = 5
+    @State private var countdown: Int?
+    @State private var countdownTask: Task<Void, Never>?
+    @State private var captured: UIImage?
+    @State private var flash = false
+
+    private let timerOptions = [0, 3, 5, 10, 15]
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            if let captured {
+                Image(uiImage: captured)
+                    .resizable()
+                    .scaledToFit()
+                    .ignoresSafeArea()
+                reviewControls
+            } else if camera.permissionDenied {
+                permissionMessage
+            } else {
+                CameraPreview(session: camera.session)
+                    .ignoresSafeArea()
+                if let countdown {
+                    Text("\(countdown)")
+                        .font(.system(size: 160, weight: .heavy, design: .rounded))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.5), radius: 12)
+                        .contentTransition(.numericText(countsDown: true))
+                        .animation(.snappy, value: countdown)
+                }
+                Color.white.opacity(flash ? 0.8 : 0).ignoresSafeArea().allowsHitTesting(false)
+                captureControls
+            }
+        }
+        .statusBarHidden()
+        .onAppear { camera.start() }
+        .onDisappear {
+            countdownTask?.cancel()
+            camera.stop()
+        }
+    }
+
+    private var captureControls: some View {
+        VStack {
+            HStack {
+                circleButton("xmark") { dismiss() }
+                Spacer()
+                Menu {
+                    Picker("Timer", selection: $timerSeconds) {
+                        ForEach(timerOptions, id: \.self) { s in
+                            Text(s == 0 ? "Off" : "\(s) seconds").tag(s)
+                        }
+                    }
+                } label: {
+                    Label(timerSeconds == 0 ? "Off" : "\(timerSeconds)s", systemImage: "timer")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(timerSeconds == 0 ? .white : .yellow)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Capsule().fill(.black.opacity(0.45)))
+                }
+                .disabled(countdown != nil)
+                Spacer()
+                circleButton("arrow.triangle.2.circlepath.camera") { camera.flip() }
+                    .disabled(countdown != nil)
+            }
+            .padding(.horizontal)
+            .padding(.top, 8)
+
+            Spacer()
+
+            Button {
+                countdown == nil ? startCapture() : cancelCountdown()
+            } label: {
+                ZStack {
+                    Circle().stroke(.white, lineWidth: 5).frame(width: 82, height: 82)
+                    if countdown == nil {
+                        Circle().fill(.white).frame(width: 66, height: 66)
+                    } else {
+                        RoundedRectangle(cornerRadius: 8).fill(.red).frame(width: 32, height: 32)
+                    }
+                }
+            }
+            .padding(.bottom, 12)
+
+            Text(countdown == nil
+                 ? (timerSeconds == 0 ? "Tap to take photo" : "Tap to start \(timerSeconds)s timer")
+                 : "Tap to cancel")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+                .padding(.bottom, 24)
+        }
+    }
+
+    private var reviewControls: some View {
+        VStack {
+            Spacer()
+            HStack(spacing: 16) {
+                Button {
+                    captured = nil
+                } label: {
+                    Label("Retake", systemImage: "arrow.counterclockwise")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Capsule().fill(.black.opacity(0.55)))
+                        .foregroundStyle(.white)
+                }
+                Button {
+                    image = captured
+                    dismiss()
+                } label: {
+                    Label("Use Photo", systemImage: "checkmark")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Capsule().fill(Theme.weight))
+                        .foregroundStyle(.white)
+                }
+            }
+            .font(.headline)
+            .padding(.horizontal)
+            .padding(.bottom, 24)
+        }
+    }
+
+    private var permissionMessage: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "camera.fill").font(.system(size: 40))
+            Text("Camera access is off for this app.")
+                .font(.headline)
+            Button("Open Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+            }
+            .buttonStyle(.borderedProminent)
+            Button("Close") { dismiss() }
+        }
+        .foregroundStyle(.white)
+        .padding()
+    }
+
+    private func circleButton(_ icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.headline)
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(.black.opacity(0.45)))
+        }
+    }
+
+    private func startCapture() {
+        let seconds = timerSeconds
+        countdownTask = Task {
+            for remaining in stride(from: seconds, to: 0, by: -1) {
+                countdown = remaining
+                AudioServicesPlaySystemSound(1103)
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                try? await Task.sleep(for: .seconds(1))
+                if Task.isCancelled { return }
+            }
+            countdown = nil
+            withAnimation(.easeOut(duration: 0.1)) { flash = true }
+            camera.capture { photo in
+                withAnimation(.easeOut(duration: 0.3)) { flash = false }
+                captured = photo
+            }
+        }
+    }
+
+    private func cancelCountdown() {
+        countdownTask?.cancel()
+        countdownTask = nil
+        countdown = nil
     }
 }
 
