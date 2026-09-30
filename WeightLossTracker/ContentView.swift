@@ -4,6 +4,7 @@ import Combine
 import UserNotifications
 import AVFoundation
 import AudioToolbox
+import HealthKit
 
 // MARK: - Models
 
@@ -180,6 +181,16 @@ class Store: ObservableObject {
     @Published var unit: WeightUnit = .kg {
         didSet { UserDefaults.standard.set(unit.rawValue, forKey: unitKey) }
     }
+    @Published var stepGoal: Int = 10000 {
+        didSet { UserDefaults.standard.set(stepGoal, forKey: stepGoalKey) }
+    }
+    @Published var healthConnected = false {
+        didSet { UserDefaults.standard.set(healthConnected, forKey: healthKey) }
+    }
+    /// Daily step totals from Apple Health for the last 7 days (oldest first), including today.
+    @Published var dailySteps: [(date: Date, steps: Int)] = []
+    @Published var stepsUpdatedAt: Date?
+    private let healthStore = HKHealthStore()
     @Published var calorieGoal: Int = 2000 {
         didSet { UserDefaults.standard.set(calorieGoal, forKey: goalKey) }
     }
@@ -196,6 +207,8 @@ class Store: ObservableObject {
     private let goalKey = "calorieGoal"
     private let roadmapKey = "roadmap"
     private let waistKey = "waistLogs"
+    private let stepGoalKey = "stepGoal"
+    private let healthKey = "healthConnected"
     private let docDir: URL
 
     init() {
@@ -208,6 +221,46 @@ class Store: ObservableObject {
         bodyFat = load(bodyFatKey) ?? []
         roadmap = load(roadmapKey)
         waist = load(waistKey) ?? []
+        let savedStepGoal = UserDefaults.standard.integer(forKey: stepGoalKey)
+        stepGoal = savedStepGoal > 0 ? savedStepGoal : 10000
+        healthConnected = UserDefaults.standard.bool(forKey: healthKey)
+    }
+
+    var stepsToday: Int { dailySteps.last?.steps ?? 0 }
+
+    var healthAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
+
+    func connectHealth() async {
+        guard healthAvailable else { return }
+        do {
+            try await healthStore.requestAuthorization(toShare: [], read: [HKQuantityType(.stepCount)])
+            healthConnected = true
+            await refreshSteps()
+        } catch {
+            healthConnected = false
+        }
+    }
+
+    /// Pulls the last 7 days of step counts (same data the Fitness/Health apps show, de-duplicated across iPhone and Watch).
+    func refreshSteps() async {
+        guard healthConnected, healthAvailable else { return }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        guard let start = cal.date(byAdding: .day, value: -6, to: today) else { return }
+
+        let predicate = HKSamplePredicate.quantitySample(
+            type: HKQuantityType(.stepCount),
+            predicate: HKQuery.predicateForSamples(withStart: start, end: nil, options: .strictStartDate))
+        let descriptor = HKStatisticsCollectionQueryDescriptor(
+            predicate: predicate, options: .cumulativeSum, anchorDate: start, intervalComponents: DateComponents(day: 1))
+
+        guard let collection = try? await descriptor.result(for: healthStore) else { return }
+        var days: [(date: Date, steps: Int)] = []
+        collection.enumerateStatistics(from: start, to: Date()) { stats, _ in
+            days.append((stats.startDate, Int(stats.sumQuantity()?.doubleValue(for: .count()) ?? 0)))
+        }
+        dailySteps = days
+        stepsUpdatedAt = Date()
     }
 
     private func load<T: Decodable>(_ key: String) -> T? {
@@ -397,6 +450,8 @@ enum Theme {
     static let olympiaColor = Color(red: 0.95, green: 0.62, blue: 0.12)
     static let roadmap = LinearGradient(colors: [Color(red: 0.20, green: 0.85, blue: 0.50), Color(red: 0.10, green: 0.55, blue: 0.95)], startPoint: .topLeading, endPoint: .bottomTrailing)
     static let roadmapColor = Color(red: 0.12, green: 0.70, blue: 0.62)
+    static let steps = LinearGradient(colors: [Color(red: 0.55, green: 0.85, blue: 0.20), Color(red: 0.10, green: 0.72, blue: 0.45)], startPoint: .topLeading, endPoint: .bottomTrailing)
+    static let stepsColor = Color(red: 0.20, green: 0.70, blue: 0.35)
 }
 
 extension View {
@@ -1015,6 +1070,9 @@ struct NutritionView: View {
     @State private var bodyFatInput = ""
     @State private var showGoalAlert = false
     @State private var goalInput = ""
+    @State private var showStepGoalAlert = false
+    @State private var stepGoalInput = ""
+    @Environment(\.scenePhase) private var scenePhase
 
     private var consumed: Int { store.calories(on: date) }
     private var remaining: Int { store.calorieGoal - consumed }
@@ -1028,6 +1086,7 @@ struct NutritionView: View {
                         .font(.subheadline.weight(.medium))
                         .card()
                     caloriesHero
+                    stepsCard
                     addFoodCard
                     foodListCard
                     weeklyCard
@@ -1048,6 +1107,131 @@ struct NutritionView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Tip: ask Mr Olympia what your goal should be.")
+            }
+            .alert("Daily Step Goal", isPresented: $showStepGoalAlert) {
+                TextField("steps", text: $stepGoalInput)
+                    .keyboardType(.numberPad)
+                Button("Save") {
+                    if let value = Int(stepGoalInput), value > 0 { store.stepGoal = value }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Your Road Map suggests a goal too. Tap \"Use as my calorie & step goals\" there to sync it.")
+            }
+            .task { await store.refreshSteps() }
+            .refreshable { await store.refreshSteps() }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { Task { await store.refreshSteps() } }
+            }
+            .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { _ in
+                Task { await store.refreshSteps() }
+            }
+        }
+    }
+
+    private var stepsCard: some View {
+        let today = store.stepsToday
+        let goal = max(store.stepGoal, 1)
+        let stepProgress = min(Double(today) / Double(goal), 1)
+        let maxDay = Double(max(store.dailySteps.map(\.steps).max() ?? 0, goal))
+
+        return HeroCard(gradient: Theme.steps) {
+            HStack {
+                Label("Steps", systemImage: "figure.walk")
+                    .font(.headline.weight(.bold))
+                Spacer()
+                Text("Apple Health")
+                    .font(.caption.weight(.semibold))
+                    .opacity(0.85)
+            }
+            .foregroundStyle(.white)
+
+            if !store.healthAvailable {
+                Text("Apple Health isn't available on this device.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.9))
+            } else if !store.healthConnected {
+                Text("Sync your steps from the iPhone Fitness / Health app to track your daily step goal.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.9))
+                Button {
+                    Task { await store.connectHealth() }
+                } label: {
+                    Label("Connect Apple Health", systemImage: "heart.fill")
+                        .font(.headline)
+                        .foregroundStyle(Theme.stepsColor)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.white))
+                }
+                .buttonStyle(.plain)
+            } else {
+                HStack(spacing: 20) {
+                    ZStack {
+                        Circle().stroke(.white.opacity(0.25), lineWidth: 12)
+                        Circle()
+                            .trim(from: 0, to: stepProgress)
+                            .stroke(.white, style: StrokeStyle(lineWidth: 12, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                            .animation(.spring, value: stepProgress)
+                        VStack(spacing: 0) {
+                            Text(today.formatted())
+                                .font(.system(size: 22, weight: .heavy, design: .rounded))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.6)
+                            Text("today")
+                                .font(.caption2.weight(.semibold))
+                                .opacity(0.85)
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                    }
+                    .frame(width: 110, height: 110)
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        StatTile(title: today >= goal ? "Goal hit!" : "To go",
+                                 value: today >= goal ? "+\((today - goal).formatted())" : (goal - today).formatted(),
+                                 icon: today >= goal ? "checkmark.seal.fill" : "shoeprints.fill")
+                        Button {
+                            stepGoalInput = "\(store.stepGoal)"
+                            showStepGoalAlert = true
+                        } label: {
+                            StatTile(title: "Goal · tap to edit", value: store.stepGoal.formatted(), icon: "target")
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                HStack(alignment: .bottom, spacing: 8) {
+                    ForEach(Array(store.dailySteps.enumerated()), id: \.offset) { _, day in
+                        VStack(spacing: 4) {
+                            Capsule()
+                                .fill(.white.opacity(day.steps >= goal ? 1 : 0.45))
+                                .frame(height: max(4, 60 * Double(day.steps) / maxDay))
+                            Text(day.date, format: .dateTime.weekday(.narrow))
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+                .frame(height: 80, alignment: .bottom)
+
+                HStack {
+                    Text("Weekly avg: \((store.dailySteps.isEmpty ? 0 : store.dailySteps.map(\.steps).reduce(0, +) / store.dailySteps.count).formatted())")
+                    Spacer()
+                    if let updated = store.stepsUpdatedAt {
+                        Text("Synced \(updated.formatted(date: .omitted, time: .shortened))")
+                    }
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+
+                if store.dailySteps.allSatisfy({ $0.steps == 0 }) {
+                    Text("Seeing 0? Open the Health app → Sharing → Apps → WeightLossTracker and turn on Steps.")
+                        .font(.caption)
+                        .foregroundStyle(.white)
+                }
             }
         }
     }
@@ -1594,11 +1778,13 @@ struct RoadMapView: View {
                 StatTile(title: "Protein", value: "\(roadmap.plan.proteinGrams)g", icon: "fork.knife")
             }
 
+            let goalsSynced = store.calorieGoal == roadmap.plan.dailyCalories && store.stepGoal == roadmap.plan.dailySteps
             Button {
                 store.calorieGoal = roadmap.plan.dailyCalories
+                store.stepGoal = roadmap.plan.dailySteps
             } label: {
-                Label(store.calorieGoal == roadmap.plan.dailyCalories ? "Calorie goal synced" : "Use as my calorie goal",
-                      systemImage: store.calorieGoal == roadmap.plan.dailyCalories ? "checkmark.circle.fill" : "arrow.triangle.2.circlepath")
+                Label(goalsSynced ? "Calorie & step goals synced" : "Use as my calorie & step goals",
+                      systemImage: goalsSynced ? "checkmark.circle.fill" : "arrow.triangle.2.circlepath")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
@@ -2137,6 +2323,9 @@ struct MrOlympiaView: View {
             let total = store.calories(on: day)
             return total > 0 ? "\(day.formatted(date: .abbreviated, time: .omitted)): \(total) kcal" : nil
         }.joined(separator: ", ")
+        let stepsText = store.dailySteps.map {
+            "\($0.date.formatted(date: .abbreviated, time: .omitted)): \($0.steps)"
+        }.joined(separator: ", ")
         let waistLogText = store.waist.suffix(6).map {
             "\($0.date.formatted(date: .abbreviated, time: .omitted)): \(String(format: "%.1f", $0.cm)) cm (\(String(format: "%.1f", $0.cm / 2.54)) in)"
         }.joined(separator: ", ")
@@ -2150,6 +2339,7 @@ struct MrOlympiaView: View {
         Recent body fat logs: \(fatText.isEmpty ? "none yet" : fatText). \
         Weekly Sunday waist logs: \(waistLogText.isEmpty ? "none yet" : waistLogText). \
         Daily calorie goal: \(store.calorieGoal) kcal. Calories eaten last 7 days: \(calorieText.isEmpty ? "none logged" : calorieText). \
+        Daily step goal: \(store.stepGoal). Steps last 7 days (Apple Health): \(stepsText.isEmpty ? "not connected" : stepsText). \
         \(roadmapText) \
         Give concise, encouraging, actionable advice using short bullet points. For calories and steps, provide reasonable estimates and explain. \
         Do not give medical diagnoses.
