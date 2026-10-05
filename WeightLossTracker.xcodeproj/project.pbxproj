@@ -146,6 +146,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = WeightLossTracker;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Take a daily progress photo";
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "Read your daily step count from Apple Health to track your step goal";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Save your progress photos to your photo library";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Choose a daily progress photo";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -308,6 +309,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = WeightLossTracker;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Take a daily progress photo";
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "Read your daily step count from Apple Health to track your step goal";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Save your progress photos to your photo library";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Choose a daily progress photo";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

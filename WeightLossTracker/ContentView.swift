@@ -331,6 +331,26 @@ class Store: ObservableObject {
         return UIImage(contentsOfFile: docDir.appendingPathComponent(fileName).path)
     }
 
+    func photoURL(for log: WeightLog) -> URL? {
+        log.photoFileName.map { docDir.appendingPathComponent($0) }
+    }
+
+    /// Every entry that has a progress photo, newest first.
+    var photoLogs: [WeightLog] {
+        logs.filter { $0.photoFileName != nil }.sorted { $0.date > $1.date }
+    }
+
+    /// Deletes just the photo from these entries; the weights stay.
+    func removePhotos(_ ids: Set<UUID>) {
+        for index in logs.indices where ids.contains(logs[index].id) {
+            if let name = logs[index].photoFileName {
+                try? FileManager.default.removeItem(at: docDir.appendingPathComponent(name))
+            }
+            logs[index].photoFileName = nil
+        }
+        persist(logs, logsKey)
+    }
+
     func addFood(date: Date, name: String, calories: Int, meal: Meal) {
         let title = name.trimmingCharacters(in: .whitespaces)
         foods.append(FoodEntry(id: UUID(), date: date, name: title.isEmpty ? meal.title : title, calories: calories, meal: meal))
@@ -632,6 +652,8 @@ struct WeightView: View {
     @State private var showSourcePicker = false
     @State private var waistInput = ""
     @State private var waistSunday = sundayOnOrBefore(Date())
+    @State private var viewerStart: PhotoViewerStart?
+    @State private var showGallery = false
     @AppStorage("roadmapLengthUnit") private var lengthUnitRaw = ""
     @AppStorage("waistReminderOn") private var reminderOn = false
     @AppStorage("waistReminderHour") private var reminderHour = 9
@@ -690,6 +712,7 @@ struct WeightView: View {
                     heroCard
                     addEntryCard
                     waistCard
+                    if !store.photoLogs.isEmpty { photosCard }
                     if store.logs.count > 1 { graphCard }
                     if !store.logs.isEmpty { historyCard }
                 }
@@ -698,7 +721,19 @@ struct WeightView: View {
             .scrollDismissesKeyboard(.interactively)
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Weight")
+            .navigationDestination(isPresented: $showGallery) { PhotoGalleryView(store: store) }
+            .fullScreenCover(item: $viewerStart) { start in
+                PhotoViewer(store: store, logs: store.photoLogs, startID: start.id)
+            }
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        showGallery = true
+                    } label: {
+                        Image(systemName: "photo.on.rectangle.angled")
+                    }
+                    .accessibilityLabel("Progress Photos")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Picker("Unit", selection: $store.unit) {
                         ForEach(WeightUnit.allCases) { Text($0.title).tag($0) }
@@ -999,6 +1034,41 @@ struct WeightView: View {
         .card()
     }
 
+    private var photosCard: some View {
+        let photos = store.photoLogs
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                SectionTitle(title: "Progress Photos", icon: "photo.on.rectangle.angled", color: Theme.weightColor)
+                Spacer()
+                Button("See All (\(photos.count))") { showGallery = true }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Theme.weightColor)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(photos.prefix(12)) { log in
+                        Button {
+                            viewerStart = PhotoViewerStart(id: log.id)
+                        } label: {
+                            VStack(spacing: 4) {
+                                PhotoThumbnail(url: store.photoURL(for: log))
+                                    .frame(width: 84, height: 112)
+                                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                Text(log.date, format: .dateTime.month(.abbreviated).day())
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .card()
+    }
+
     private var historyCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionTitle(title: "History", icon: "clock.fill", color: Theme.weightColor)
@@ -1013,12 +1083,15 @@ struct WeightView: View {
 
             ForEach(store.logs.reversed()) { log in
                 HStack(spacing: 12) {
-                    if let uiImage = store.image(for: log.photoFileName) {
-                        Image(uiImage: uiImage)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 54, height: 54)
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    if log.photoFileName != nil {
+                        Button {
+                            viewerStart = PhotoViewerStart(id: log.id)
+                        } label: {
+                            PhotoThumbnail(url: store.photoURL(for: log))
+                                .frame(width: 54, height: 54)
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
                     } else {
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
                             .fill(Theme.weightColor.opacity(0.12))
@@ -2684,6 +2757,311 @@ struct ProgressChart: View {
             }
         }
     }
+}
+
+// MARK: - Progress Photos (thumbnails, viewer, gallery)
+
+struct PhotoViewerStart: Identifiable {
+    let id: UUID
+}
+
+/// Loads a downscaled copy of a stored photo off the main thread so grids and lists stay smooth.
+struct PhotoThumbnail: View {
+    let url: URL?
+    private static let cache = NSCache<NSURL, UIImage>()
+    @State private var image: UIImage?
+
+    var body: some View {
+        Rectangle()
+            .fill(Theme.weightColor.opacity(0.12))
+            .overlay {
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
+                } else {
+                    ProgressView()
+                }
+            }
+            .clipped()
+            .task(id: url) {
+                guard let url else { return }
+                if let cached = Self.cache.object(forKey: url as NSURL) { image = cached; return }
+                let loaded = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                    guard let full = UIImage(contentsOfFile: url.path), full.size.width > 0 else { return nil }
+                    let width: CGFloat = 400
+                    return full.preparingThumbnail(of: CGSize(width: width, height: width * full.size.height / full.size.width))
+                }.value
+                if let loaded { Self.cache.setObject(loaded, forKey: url as NSURL) }
+                image = loaded
+            }
+    }
+}
+
+/// Full-resolution photo with pinch-to-zoom, double-tap zoom, and panning while zoomed.
+struct ZoomablePhoto: View {
+    let url: URL?
+    @State private var image: UIImage?
+    @State private var scale: CGFloat = 1
+    @State private var lastScale: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .scaleEffect(scale)
+                        .offset(offset)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                } else {
+                    ProgressView().tint(.white)
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                MagnifyGesture()
+                    .onChanged { value in scale = min(max(1, lastScale * value.magnification), 5) }
+                    .onEnded { _ in
+                        lastScale = scale
+                        if scale == 1 { withAnimation(.snappy) { offset = .zero }; lastOffset = .zero }
+                    }
+            )
+            .gesture(
+                DragGesture()
+                    .onChanged { value in
+                        offset = CGSize(width: lastOffset.width + value.translation.width,
+                                        height: lastOffset.height + value.translation.height)
+                    }
+                    .onEnded { _ in lastOffset = offset },
+                including: scale > 1 ? .all : .none
+            )
+            .onTapGesture(count: 2) {
+                withAnimation(.snappy) {
+                    scale = scale > 1 ? 1 : 2.5
+                    lastScale = scale
+                    offset = .zero
+                    lastOffset = .zero
+                }
+            }
+        }
+        .task(id: url) {
+            guard let url else { return }
+            image = await Task.detached(priority: .userInitiated) { UIImage(contentsOfFile: url.path) }.value
+        }
+    }
+}
+
+struct PhotoViewer: View {
+    @ObservedObject var store: Store
+    let logs: [WeightLog]
+    @State private var selection: UUID
+    @State private var shareImages: [UIImage] = []
+    @State private var showShare = false
+    @Environment(\.dismiss) private var dismiss
+
+    init(store: Store, logs: [WeightLog], startID: UUID) {
+        self.store = store
+        self.logs = logs
+        _selection = State(initialValue: startID)
+    }
+
+    private var current: WeightLog? { logs.first { $0.id == selection } }
+    private var position: Int { (logs.firstIndex { $0.id == selection } ?? 0) + 1 }
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            TabView(selection: $selection) {
+                ForEach(logs) { log in
+                    ZoomablePhoto(url: store.photoURL(for: log)).tag(log.id)
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .ignoresSafeArea()
+
+            VStack {
+                HStack(alignment: .top) {
+                    viewerButton("xmark") { dismiss() }
+                    Spacer()
+                    if let current {
+                        VStack(spacing: 2) {
+                            Text(current.date, format: .dateTime.weekday(.wide).month().day().year())
+                                .font(.subheadline.weight(.semibold))
+                            Text("\(store.display(weightKg: current.weightKg)) \(store.unit.title)")
+                                .font(.headline.weight(.heavy))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Capsule().fill(.black.opacity(0.45)))
+                    }
+                    Spacer()
+                    viewerButton("square.and.arrow.up") {
+                        if let current, let url = store.photoURL(for: current), let image = UIImage(contentsOfFile: url.path) {
+                            shareImages = [image]
+                            showShare = true
+                        }
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+
+                Spacer()
+
+                Text("\(position) of \(logs.count) · pinch or double-tap to zoom")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(.black.opacity(0.45)))
+                    .padding(.bottom, 12)
+            }
+        }
+        .statusBarHidden()
+        .sheet(isPresented: $showShare) { ShareSheet(items: shareImages) }
+    }
+
+    private func viewerButton(_ icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.headline)
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(.black.opacity(0.45)))
+        }
+    }
+}
+
+struct PhotoGalleryView: View {
+    @ObservedObject var store: Store
+    @State private var selecting = false
+    @State private var selected: Set<UUID> = []
+    @State private var viewerStart: PhotoViewerStart?
+    @State private var shareImages: [UIImage] = []
+    @State private var showShare = false
+    @State private var confirmDelete = false
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 3)
+
+    var body: some View {
+        let photos = store.photoLogs
+
+        ScrollView {
+            if photos.isEmpty {
+                EmptyHint(icon: "photo.on.rectangle.angled", text: "No progress photos yet. Add one when you log your weight.")
+                    .padding(.top, 60)
+            } else {
+                LazyVGrid(columns: columns, spacing: 3) {
+                    ForEach(photos) { log in
+                        Button {
+                            if selecting {
+                                if selected.contains(log.id) { selected.remove(log.id) } else { selected.insert(log.id) }
+                            } else {
+                                viewerStart = PhotoViewerStart(id: log.id)
+                            }
+                        } label: {
+                            PhotoThumbnail(url: store.photoURL(for: log))
+                                .aspectRatio(3 / 4, contentMode: .fit)
+                                .overlay(alignment: .bottomLeading) {
+                                    VStack(alignment: .leading, spacing: 0) {
+                                        Text(log.date, format: .dateTime.month(.abbreviated).day())
+                                        Text("\(store.display(weightKg: log.weightKg)) \(store.unit.title)")
+                                    }
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(.white)
+                                    .shadow(color: .black.opacity(0.6), radius: 3)
+                                    .padding(6)
+                                }
+                                .overlay(alignment: .topTrailing) {
+                                    if selecting {
+                                        Image(systemName: selected.contains(log.id) ? "checkmark.circle.fill" : "circle")
+                                            .font(.title3)
+                                            .foregroundStyle(selected.contains(log.id) ? Theme.weightColor : .white)
+                                            .background(Circle().fill(.white).padding(3).opacity(selected.contains(log.id) ? 1 : 0))
+                                            .shadow(radius: 2)
+                                            .padding(6)
+                                    }
+                                }
+                                .overlay {
+                                    if selecting && selected.contains(log.id) {
+                                        Rectangle().stroke(Theme.weightColor, lineWidth: 3)
+                                    }
+                                }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 3)
+            }
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle(selecting ? "\(selected.count) Selected" : "Progress Photos")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if !photos.isEmpty {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(selecting ? "Done" : "Select") {
+                        withAnimation(.snappy) {
+                            selecting.toggle()
+                            selected.removeAll()
+                        }
+                    }
+                }
+            }
+            if selecting {
+                ToolbarItemGroup(placement: .bottomBar) {
+                    Button(selected.count == photos.count ? "Deselect All" : "Select All") {
+                        selected = selected.count == photos.count ? [] : Set(photos.map(\.id))
+                    }
+                    Spacer()
+                    Button {
+                        shareImages = photos.filter { selected.contains($0.id) }
+                            .compactMap { store.photoURL(for: $0) }
+                            .compactMap { UIImage(contentsOfFile: $0.path) }
+                        showShare = !shareImages.isEmpty
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .disabled(selected.isEmpty)
+                    Spacer()
+                    Button(role: .destructive) {
+                        confirmDelete = true
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .disabled(selected.isEmpty)
+                }
+            }
+        }
+        .tint(Theme.weightColor)
+        .fullScreenCover(item: $viewerStart) { start in
+            PhotoViewer(store: store, logs: photos, startID: start.id)
+        }
+        .sheet(isPresented: $showShare) { ShareSheet(items: shareImages) }
+        .confirmationDialog("Delete \(selected.count) photo\(selected.count == 1 ? "" : "s")?", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("Delete Photos", role: .destructive) {
+                store.removePhotos(selected)
+                selected.removeAll()
+                if store.photoLogs.isEmpty { selecting = false }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Only the photos are deleted. Your weight entries stay.")
+        }
+    }
+}
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - Photo Source + Timer Camera
