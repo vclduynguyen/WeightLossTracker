@@ -401,6 +401,16 @@ class Store: ObservableObject {
         persist(foodLogs, healthFoodsKey)
     }
 
+    /// Daily macro targets (grams) from the Road Map: protein is the plan's recommendation,
+    /// fat is 25% of the calorie goal, carbs fill the remaining calories. Nil until a roadmap exists.
+    var macroGoals: (protein: Int, carbs: Int, fat: Int)? {
+        guard let plan = roadmap?.plan else { return nil }
+        let protein = plan.proteinGrams
+        let fat = Int((Double(calorieGoal) * 0.25 / 9).rounded())
+        let carbs = max(Int((Double(calorieGoal - protein * 4 - fat * 9) / 4).rounded()), 0)
+        return (protein, carbs, fat)
+    }
+
     /// Macros synced from Apple Health for a day (grams). Nil when nothing was synced.
     func macros(on date: Date) -> (protein: Int, carbs: Int, fat: Int)? {
         guard let log = foodLogs.first(where: { Calendar.current.isDate($0.date, inSameDayAs: date) }),
@@ -1342,9 +1352,6 @@ struct WeightView: View {
 struct NutritionView: View {
     @ObservedObject var store: Store
     @State private var date = Date()
-    @State private var foodName = ""
-    @State private var caloriesInput = ""
-    @State private var meal: Meal = .breakfast
     @State private var bodyFatInput = ""
     @State private var showGoalAlert = false
     @State private var goalInput = ""
@@ -1366,8 +1373,6 @@ struct NutritionView: View {
                     caloriesHero
                     macrosCard
                     stepsCard
-                    addFoodCard
-                    foodListCard
                     weeklyCard
                     bodyFatCard
                 }
@@ -1526,14 +1531,16 @@ struct NutritionView: View {
             }
 
             if let m = store.macros(on: date) {
+                let goals = store.macroGoals
                 let pCal = Double(m.protein * 4), cCal = Double(m.carbs * 4), fCal = Double(m.fat * 9)
                 let total = max(pCal + cCal + fCal, 1)
-                let macros: [(name: String, grams: Int, cal: Double, color: Color)] = [
-                    ("Protein", m.protein, pCal, .blue),
-                    ("Carbs", m.carbs, cCal, .orange),
-                    ("Fat", m.fat, fCal, .pink)
+                let macros: [(name: String, grams: Int, goal: Int?, cal: Double, color: Color)] = [
+                    ("Protein", m.protein, goals?.protein, pCal, .blue),
+                    ("Carbs", m.carbs, goals?.carbs, cCal, .orange),
+                    ("Fat", m.fat, goals?.fat, fCal, .pink)
                 ]
 
+                // Split of today's calories by macro
                 GeometryReader { geo in
                     HStack(spacing: 2) {
                         ForEach(macros, id: \.name) { macro in
@@ -1542,23 +1549,60 @@ struct NutritionView: View {
                         }
                     }
                 }
-                .frame(height: 12)
+                .frame(height: 10)
 
-                HStack(spacing: 0) {
+                // Actual vs goal, one row per macro
+                VStack(spacing: 12) {
                     ForEach(macros, id: \.name) { macro in
-                        VStack(spacing: 4) {
-                            Text("\(macro.grams)g")
-                                .font(.title3.weight(.heavy))
-                                .foregroundStyle(macro.color)
-                            Text(macro.name)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            Text("\(Int((macro.cal / total * 100).rounded()))%")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Circle().fill(macro.color).frame(width: 8, height: 8)
+                                Text(macro.name)
+                                    .font(.subheadline.weight(.semibold))
+                                Spacer()
+                                if let goal = macro.goal, goal > 0 {
+                                    let diff = macro.grams - goal
+                                    Text("\(macro.grams)g")
+                                        .font(.headline.weight(.heavy))
+                                        .foregroundStyle(macro.color)
+                                    + Text(" / \(goal)g")
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.secondary)
+                                    Text(diff == 0 ? "on target" : (diff > 0 ? "+\(diff)g" : "\(diff)g"))
+                                        .font(.caption.weight(.bold))
+                                        .foregroundStyle(macroStatusColor(name: macro.name, diff: diff, goal: goal))
+                                        .frame(minWidth: 58, alignment: .trailing)
+                                } else {
+                                    Text("\(macro.grams)g")
+                                        .font(.headline.weight(.heavy))
+                                        .foregroundStyle(macro.color)
+                                    Text("\(Int((macro.cal / total * 100).rounded()))% of kcal")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            if let goal = macro.goal, goal > 0 {
+                                GeometryReader { geo in
+                                    ZStack(alignment: .leading) {
+                                        Capsule().fill(macro.color.opacity(0.15))
+                                        Capsule().fill(macro.color)
+                                            .frame(width: geo.size.width * min(Double(macro.grams) / Double(goal), 1))
+                                    }
+                                }
+                                .frame(height: 8)
+                            }
                         }
-                        .frame(maxWidth: .infinity)
                     }
+                }
+
+                if goals == nil {
+                    Text("Generate a plan on the Road Map tab to see goal macros here.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Goals from your Road Map: protein as recommended, fat at 25% of your \(store.calorieGoal) kcal goal, carbs fill the rest.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             } else if !store.healthConnected {
                 EmptyHint(icon: "heart.text.square", text: "Connect Apple Health on the Steps card to see protein, carbs and fat from MyFitnessPal.")
@@ -1567,6 +1611,14 @@ struct NutritionView: View {
             }
         }
         .card()
+    }
+
+    /// Protein: under is bad, over is fine. Carbs/fat: within ~10% of goal is good, over is a warning.
+    private func macroStatusColor(name: String, diff: Int, goal: Int) -> Color {
+        let tolerance = max(Int(Double(goal) * 0.1), 5)
+        if name == "Protein" { return diff >= -tolerance ? .green : .orange }
+        if abs(diff) <= tolerance { return .green }
+        return diff > 0 ? .red : .orange
     }
 
     private var caloriesHero: some View {
@@ -1603,99 +1655,6 @@ struct NutritionView: View {
                 }
             }
         }
-    }
-
-    private var addFoodCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            SectionTitle(title: "Add Food", icon: "fork.knife", color: Theme.caloriesColor)
-
-            HStack(spacing: 8) {
-                ForEach(Meal.allCases) { item in
-                    Button {
-                        meal = item
-                    } label: {
-                        VStack(spacing: 4) {
-                            Image(systemName: item.icon)
-                            Text(item.title).font(.caption2.weight(.semibold))
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .foregroundStyle(meal == item ? .white : Theme.caloriesColor)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .fill(meal == item ? AnyShapeStyle(Theme.calories) : AnyShapeStyle(Theme.caloriesColor.opacity(0.12)))
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-
-            TextField("Food name (e.g. Chicken rice)", text: $foodName)
-                .inputField()
-
-            HStack {
-                TextField("Calories", text: $caloriesInput)
-                    .keyboardType(.numberPad)
-                Text("kcal").foregroundStyle(.secondary)
-            }
-            .inputField()
-
-            Button {
-                if let kcal = Int(caloriesInput) {
-                    store.addFood(date: date, name: foodName, calories: kcal, meal: meal)
-                    foodName = ""
-                    caloriesInput = ""
-                    hideKeyboard()
-                }
-            } label: {
-                Label("Add", systemImage: "plus.circle.fill")
-            }
-            .buttonStyle(GradientButtonStyle(gradient: Theme.calories))
-            .disabled(Int(caloriesInput) == nil)
-        }
-        .card()
-    }
-
-    private var foodListCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SectionTitle(title: "Meals", icon: "list.bullet", color: Theme.caloriesColor)
-            let entries = store.foods(on: date)
-            if entries.isEmpty {
-                EmptyHint(icon: "takeoutbag.and.cup.and.straw", text: "Nothing logged for this day yet.")
-            } else {
-                ForEach(Meal.allCases) { item in
-                    let group = entries.filter { $0.meal == item }
-                    if !group.isEmpty {
-                        HStack {
-                            Label(item.title, systemImage: item.icon)
-                                .font(.subheadline.weight(.bold))
-                                .foregroundStyle(Theme.caloriesColor)
-                            Spacer()
-                            Text("\(group.reduce(0) { $0 + $1.calories }) kcal")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                        }
-                        ForEach(group) { entry in
-                            HStack {
-                                Text(entry.name)
-                                Spacer()
-                                Text("\(entry.calories)")
-                                    .font(.body.monospacedDigit().weight(.semibold))
-                                Button {
-                                    withAnimation { store.deleteFood(entry) }
-                                } label: {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .foregroundStyle(.tertiary)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            .padding(.leading, 26)
-                        }
-                    }
-                }
-            }
-        }
-        .card()
     }
 
     private var weeklyCard: some View {
