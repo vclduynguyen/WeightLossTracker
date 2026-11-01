@@ -27,6 +27,85 @@ struct WeightLog: Identifiable, Codable {
     var date: Date
     var weightKg: Double
     var photoFileName: String?
+    var additionalPhotos: [String: String] = [:]
+
+    enum CodingKeys: String, CodingKey {
+        case id, date, weightKg, photoFileName, additionalPhotos
+    }
+
+    init(id: UUID, date: Date, weightKg: Double, photoFileName: String? = nil, additionalPhotos: [String: String] = [:]) {
+        self.id = id
+        self.date = date
+        self.weightKg = weightKg
+        self.photoFileName = photoFileName
+        self.additionalPhotos = additionalPhotos
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        date = try container.decode(Date.self, forKey: .date)
+        weightKg = try container.decode(Double.self, forKey: .weightKg)
+        photoFileName = try container.decodeIfPresent(String.self, forKey: .photoFileName)
+        additionalPhotos = try container.decodeIfPresent([String: String].self, forKey: .additionalPhotos) ?? [:]
+    }
+}
+
+struct FoodLog: Identifiable, Codable {
+    var id: UUID
+    var date: Date
+    var calories: Int
+    var protein: Int? = nil
+    var carbs: Int? = nil
+    var fat: Int? = nil
+    var name: String?
+}
+
+struct PhysiqueScan: Identifiable, Codable {
+    var id: UUID
+    var date: Date
+    var photoFileName: String
+    var weightKg: Double
+    var sex: String
+    var bodyFat: Double
+    var low: Double
+    var high: Double
+    var summary: String
+    var cues: [String]
+    var generated: [String: String] = [:]
+
+    enum CodingKeys: String, CodingKey {
+        case id, date, photoFileName, weightKg, sex, bodyFat, low, high, summary, cues, generated
+    }
+
+    init(id: UUID, date: Date, photoFileName: String, weightKg: Double, sex: String, bodyFat: Double, low: Double, high: Double, summary: String, cues: [String], generated: [String: String] = [:]) {
+        self.id = id
+        self.date = date
+        self.photoFileName = photoFileName
+        self.weightKg = weightKg
+        self.sex = sex
+        self.bodyFat = bodyFat
+        self.low = low
+        self.high = high
+        self.summary = summary
+        self.cues = cues
+        self.generated = generated
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        date = try container.decode(Date.self, forKey: .date)
+        photoFileName = try container.decode(String.self, forKey: .photoFileName)
+        weightKg = try container.decode(Double.self, forKey: .weightKg)
+        sex = try container.decode(String.self, forKey: .sex)
+        bodyFat = try container.decode(Double.self, forKey: .bodyFat)
+        low = try container.decode(Double.self, forKey: .low)
+        high = try container.decode(Double.self, forKey: .high)
+        summary = try container.decode(String.self, forKey: .summary)
+        cues = try container.decodeIfPresent([String].self, forKey: .cues) ?? []
+        generated = try container.decodeIfPresent([String: String].self, forKey: .generated) ?? [:]
+    }
 }
 
 enum Meal: String, Codable, CaseIterable, Identifiable {
@@ -190,6 +269,19 @@ class Store: ObservableObject {
     /// Daily step totals from Apple Health for the last 7 days (oldest first), including today.
     @Published var dailySteps: [(date: Date, steps: Int)] = []
     @Published var stepsUpdatedAt: Date?
+    @Published var foodLogs: [FoodLog] = []
+    @Published var scans: [PhysiqueScan] = [] {
+        didSet { persist(scans, scansKey) }
+    }
+    /// Mr Olympia conversation, kept across app launches so the coach remembers past sessions.
+    @Published var chat: [ChatMessage] = [] {
+        didSet { persist(chat, chatKey) }
+    }
+
+    func clearChat() {
+        for msg in chat { if let name = msg.imageFileName { try? FileManager.default.removeItem(at: docDir.appendingPathComponent(name)) } }
+        chat = []
+    }
     private let healthStore = HKHealthStore()
     @Published var calorieGoal: Int = 2000 {
         didSet { UserDefaults.standard.set(calorieGoal, forKey: goalKey) }
@@ -209,6 +301,9 @@ class Store: ObservableObject {
     private let waistKey = "waistLogs"
     private let stepGoalKey = "stepGoal"
     private let healthKey = "healthConnected"
+    private let scansKey = "physiqueScans"
+    private let healthFoodsKey = "healthFoodLogs"
+    private let chatKey = "olympiaChat"
     private let docDir: URL
 
     init() {
@@ -218,9 +313,12 @@ class Store: ObservableObject {
         calorieGoal = goal > 0 ? goal : 2000
         logs = load(logsKey) ?? []
         foods = load(foodsKey) ?? []
+        foodLogs = load(healthFoodsKey) ?? []
         bodyFat = load(bodyFatKey) ?? []
         roadmap = load(roadmapKey)
         waist = load(waistKey) ?? []
+        scans = load(scansKey) ?? []
+        chat = load(chatKey) ?? []
         let savedStepGoal = UserDefaults.standard.integer(forKey: stepGoalKey)
         stepGoal = savedStepGoal > 0 ? savedStepGoal : 10000
         healthConnected = UserDefaults.standard.bool(forKey: healthKey)
@@ -233,9 +331,13 @@ class Store: ObservableObject {
     func connectHealth() async {
         guard healthAvailable else { return }
         do {
-            try await healthStore.requestAuthorization(toShare: [], read: [HKQuantityType(.stepCount)])
+            try await healthStore.requestAuthorization(toShare: [], read: [
+                HKQuantityType(.stepCount), HKQuantityType(.dietaryEnergyConsumed),
+                HKQuantityType(.dietaryProtein), HKQuantityType(.dietaryCarbohydrates), HKQuantityType(.dietaryFatTotal)
+            ])
             healthConnected = true
             await refreshSteps()
+            await refreshFoods()
         } catch {
             healthConnected = false
         }
@@ -261,6 +363,49 @@ class Store: ObservableObject {
         }
         dailySteps = days
         stepsUpdatedAt = Date()
+    }
+
+    /// Pulls food/calorie data from Apple Health (MyFitnessPal sync).
+    func refreshFoods() async {
+        guard healthConnected, healthAvailable else { return }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        guard let start = cal.date(byAdding: .day, value: -30, to: today) else { return }
+
+        /// Daily sums for one nutrient, keyed by start of day.
+        func dailyTotals(_ id: HKQuantityTypeIdentifier, unit: HKUnit) async -> [Date: Int] {
+            let predicate = HKSamplePredicate.quantitySample(
+                type: HKQuantityType(id),
+                predicate: HKQuery.predicateForSamples(withStart: start, end: nil, options: .strictStartDate))
+            let descriptor = HKStatisticsCollectionQueryDescriptor(
+                predicate: predicate, options: .cumulativeSum, anchorDate: start, intervalComponents: DateComponents(day: 1))
+            guard let collection = try? await descriptor.result(for: healthStore) else { return [:] }
+            var totals: [Date: Int] = [:]
+            collection.enumerateStatistics(from: start, to: Date()) { stats, _ in
+                let value = Int((stats.sumQuantity()?.doubleValue(for: unit) ?? 0).rounded())
+                if value > 0 { totals[stats.startDate] = value }
+            }
+            return totals
+        }
+
+        let kcal = await dailyTotals(.dietaryEnergyConsumed, unit: .kilocalorie())
+        let protein = await dailyTotals(.dietaryProtein, unit: .gram())
+        let carbs = await dailyTotals(.dietaryCarbohydrates, unit: .gram())
+        let fat = await dailyTotals(.dietaryFatTotal, unit: .gram())
+
+        let allDays = Set(kcal.keys).union(protein.keys).union(carbs.keys).union(fat.keys)
+        foodLogs = allDays.sorted().map { day in
+            FoodLog(id: UUID(), date: day, calories: kcal[day] ?? 0,
+                    protein: protein[day], carbs: carbs[day], fat: fat[day], name: "Apple Health")
+        }
+        persist(foodLogs, healthFoodsKey)
+    }
+
+    /// Macros synced from Apple Health for a day (grams). Nil when nothing was synced.
+    func macros(on date: Date) -> (protein: Int, carbs: Int, fat: Int)? {
+        guard let log = foodLogs.first(where: { Calendar.current.isDate($0.date, inSameDayAs: date) }),
+              log.protein != nil || log.carbs != nil || log.fat != nil else { return nil }
+        return (log.protein ?? 0, log.carbs ?? 0, log.fat ?? 0)
     }
 
     private func load<T: Decodable>(_ key: String) -> T? {
@@ -303,8 +448,47 @@ class Store: ObservableObject {
         persist(logs, logsKey)
     }
 
+    func addLog(date: Date, weight: String, photos: [String: UIImage]?) {
+        guard let entered = parseNumber(weight) else { return }
+        let kg = unit == .lb ? entered / 2.20462262 : entered
+
+        var photoName: String? = nil
+        var additionalPhotos: [String: String] = [:]
+
+        if let photos = photos {
+            for (angle, image) in photos {
+                if let data = image.jpegData(compressionQuality: 0.85) {
+                    let name = "\(UUID().uuidString).jpg"
+                    try? data.write(to: docDir.appendingPathComponent(name))
+                    if angle == "front" {
+                        photoName = name
+                    } else {
+                        additionalPhotos[angle] = name
+                    }
+                }
+            }
+        }
+
+        var existing = logs
+        if let index = existing.firstIndex(where: { Calendar.current.isDate($0.date, inSameDayAs: date) }) {
+            existing[index].weightKg = kg
+            if let photoName { existing[index].photoFileName = photoName }
+            if !additionalPhotos.isEmpty {
+                existing[index].additionalPhotos = additionalPhotos
+            }
+        } else {
+            existing.append(WeightLog(id: UUID(), date: date, weightKg: kg, photoFileName: photoName, additionalPhotos: additionalPhotos))
+        }
+
+        logs = existing.sorted { $0.date < $1.date }
+        persist(logs, logsKey)
+    }
+
     func deleteLog(_ log: WeightLog) {
         if let name = log.photoFileName {
+            try? FileManager.default.removeItem(at: docDir.appendingPathComponent(name))
+        }
+        for (_, name) in log.additionalPhotos {
             try? FileManager.default.removeItem(at: docDir.appendingPathComponent(name))
         }
         logs.removeAll { $0.id == log.id }
@@ -333,6 +517,15 @@ class Store: ObservableObject {
 
     func photoURL(for log: WeightLog) -> URL? {
         log.photoFileName.map { docDir.appendingPathComponent($0) }
+    }
+
+    func photoURL(for log: WeightLog, angle: String) -> URL? {
+        if angle == "front" {
+            return log.photoFileName.map { docDir.appendingPathComponent($0) }
+        } else if let name = log.additionalPhotos[angle] {
+            return docDir.appendingPathComponent(name)
+        }
+        return nil
     }
 
     /// Every entry that has a progress photo, newest first.
@@ -367,7 +560,9 @@ class Store: ObservableObject {
     }
 
     func calories(on date: Date) -> Int {
-        foods(on: date).reduce(0) { $0 + $1.calories }
+        let manualCalories = foods(on: date).reduce(0) { $0 + $1.calories }
+        let healthCalories = foodLogs.filter { Calendar.current.isDate($0.date, inSameDayAs: date) }.reduce(0) { $0 + $1.calories }
+        return manualCalories + healthCalories
     }
 
     func addBodyFat(date: Date, percent: Double) {
@@ -635,6 +830,8 @@ struct ContentView: View {
                 .tabItem { Label("Nutrition", systemImage: "flame.fill") }
             RoadMapView(store: store)
                 .tabItem { Label("Road Map", systemImage: "map.fill") }
+            PhysiqueView(store: store)
+                .tabItem { Label("Physique", systemImage: "figure") }
             MrOlympiaView(store: store)
                 .tabItem { Label("Mr Olympia", systemImage: "trophy.fill") }
         }
@@ -648,8 +845,8 @@ struct WeightView: View {
     @ObservedObject var store: Store
     @State private var date = Date()
     @State private var weightInput = ""
-    @State private var selectedImage: UIImage?
-    @State private var showSourcePicker = false
+    @State private var selectedImages: [String: UIImage] = [:]
+    @State private var showCamera = false
     @State private var waistInput = ""
     @State private var waistSunday = sundayOnOrBefore(Date())
     @State private var viewerStart: PhotoViewerStart?
@@ -747,7 +944,9 @@ struct WeightView: View {
             .onChange(of: store.waist.map(\.date)) { _, _ in
                 Task { await rescheduleReminders() }
             }
-            .photoSourcePicker(title: "Photo", isPresented: $showSourcePicker, image: $selectedImage)
+            .fullScreenCover(isPresented: $showCamera) {
+                MultiAngleCameraView(images: $selectedImages)
+            }
         }
     }
 
@@ -838,13 +1037,19 @@ struct WeightView: View {
                 .inputField()
 
                 Button {
-                    showSourcePicker = true
+                    showCamera = true
                 } label: {
-                    Group {
-                        if let selectedImage {
-                            Image(uiImage: selectedImage)
+                    ZStack {
+                        if !selectedImages.isEmpty {
+                            Image(uiImage: selectedImages["front"]!)
                                 .resizable()
                                 .scaledToFill()
+                            if selectedImages.count > 1 {
+                                Circle()
+                                    .fill(Theme.weightColor)
+                                    .frame(width: 18, height: 18)
+                                    .overlay(Text("\(selectedImages.count)").font(.caption2.weight(.bold)).foregroundStyle(.white))
+                            }
                         } else {
                             Image(systemName: "camera.fill")
                                 .font(.title3)
@@ -858,9 +1063,9 @@ struct WeightView: View {
             }
 
             Button {
-                store.addLog(date: date, weight: weightInput, photo: selectedImage)
+                store.addLog(date: date, weight: weightInput, photos: selectedImages.isEmpty ? nil : selectedImages)
                 weightInput = ""
-                selectedImage = nil
+                selectedImages = [:]
                 hideKeyboard()
             } label: {
                 Label("Save Entry", systemImage: "checkmark.circle.fill")
@@ -1159,6 +1364,7 @@ struct NutritionView: View {
                         .font(.subheadline.weight(.medium))
                         .card()
                     caloriesHero
+                    macrosCard
                     stepsCard
                     addFoodCard
                     foodListCard
@@ -1191,13 +1397,13 @@ struct NutritionView: View {
             } message: {
                 Text("Your Road Map suggests a goal too. Tap \"Use as my calorie & step goals\" there to sync it.")
             }
-            .task { await store.refreshSteps() }
-            .refreshable { await store.refreshSteps() }
+            .task { await store.refreshSteps(); await store.refreshFoods() }
+            .refreshable { await store.refreshSteps(); await store.refreshFoods() }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active { Task { await store.refreshSteps() } }
+                if phase == .active { Task { await store.refreshSteps(); await store.refreshFoods() } }
             }
             .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { _ in
-                Task { await store.refreshSteps() }
+                Task { await store.refreshSteps(); await store.refreshFoods() }
             }
         }
     }
@@ -1307,6 +1513,60 @@ struct NutritionView: View {
                 }
             }
         }
+    }
+
+    private var macrosCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                SectionTitle(title: "Macros", icon: "chart.pie.fill", color: Theme.caloriesColor)
+                Spacer()
+                Text("Apple Health")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            if let m = store.macros(on: date) {
+                let pCal = Double(m.protein * 4), cCal = Double(m.carbs * 4), fCal = Double(m.fat * 9)
+                let total = max(pCal + cCal + fCal, 1)
+                let macros: [(name: String, grams: Int, cal: Double, color: Color)] = [
+                    ("Protein", m.protein, pCal, .blue),
+                    ("Carbs", m.carbs, cCal, .orange),
+                    ("Fat", m.fat, fCal, .pink)
+                ]
+
+                GeometryReader { geo in
+                    HStack(spacing: 2) {
+                        ForEach(macros, id: \.name) { macro in
+                            Capsule().fill(macro.color)
+                                .frame(width: max(geo.size.width * macro.cal / total - 2, 0))
+                        }
+                    }
+                }
+                .frame(height: 12)
+
+                HStack(spacing: 0) {
+                    ForEach(macros, id: \.name) { macro in
+                        VStack(spacing: 4) {
+                            Text("\(macro.grams)g")
+                                .font(.title3.weight(.heavy))
+                                .foregroundStyle(macro.color)
+                            Text(macro.name)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Text("\(Int((macro.cal / total * 100).rounded()))%")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+            } else if !store.healthConnected {
+                EmptyHint(icon: "heart.text.square", text: "Connect Apple Health on the Steps card to see protein, carbs and fat from MyFitnessPal.")
+            } else {
+                EmptyHint(icon: "fork.knife", text: "No macros synced for this day yet. Log a meal in MyFitnessPal and pull down to refresh.")
+            }
+        }
+        .card()
     }
 
     private var caloriesHero: some View {
@@ -2152,10 +2412,11 @@ struct MrOlympiaView: View {
     @State private var keyInput: String = ""
     @State private var revealKey = false
     @State private var input = ""
-    @State private var messages: [ChatMessage] = []
     @State private var isLoading = false
     @State private var selectedImage: UIImage?
     @State private var showSourcePicker = false
+
+    private var messages: [ChatMessage] { store.chat }
 
     private let suggestions = [
         "Rate my physique and what to improve",
@@ -2203,7 +2464,7 @@ struct MrOlympiaView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     if !messages.isEmpty {
                         Button {
-                            withAnimation { messages.removeAll() }
+                            withAnimation { store.clearChat() }
                         } label: {
                             Image(systemName: "trash")
                         }
@@ -2373,13 +2634,15 @@ struct MrOlympiaView: View {
 
     private func performSend() {
         guard !apiKey.isEmpty else {
-            messages.append(ChatMessage(role: "assistant", content: "Please save your Gemini API key first. Get a free one at aistudio.google.com/app/apikey", image: nil))
+            store.chat.append(ChatMessage(role: "assistant", content: "Please save your Gemini API key first. Get a free one at aistudio.google.com/app/apikey", image: nil))
             showKeyPanel = true
             return
         }
 
         let prompt = input.isEmpty ? "What do you think of my physique and what should I improve?" : input
-        messages.append(ChatMessage(role: "user", content: prompt, image: selectedImage))
+        // Everything before this message is history the coach should remember.
+        let history = Array(store.chat.suffix(40))
+        store.chat.append(ChatMessage(role: "user", content: prompt, image: selectedImage))
         input = ""
         isLoading = true
         hideKeyboard()
@@ -2415,19 +2678,24 @@ struct MrOlympiaView: View {
         Daily step goal: \(store.stepGoal). Steps last 7 days (Apple Health): \(stepsText.isEmpty ? "not connected" : stepsText). \
         \(roadmapText) \
         Give concise, encouraging, actionable advice using short bullet points. For calories and steps, provide reasonable estimates and explain. \
-        Do not give medical diagnoses.
+        Do not give medical diagnoses. \
+        Memory: this is an ongoing conversation that continues across days. The earlier messages are your shared history; remember what the user told you \
+        (goals, injuries, preferences, schedule, past advice you gave) and build on it. Refer back to it when relevant and notice progress or changes. \
+        Style: \(history.isEmpty ? "This is the very first message, so a brief one-line hello is fine." : "You are mid-conversation. Do NOT greet, reintroduce yourself, or open with 'Hey champ' or any stock opener.") \
+        Never start two replies the same way. Vary how you open: sometimes dive straight into the answer, sometimes react to what they said, sometimes ask a quick follow-up first. \
+        Today is \(Date().formatted(date: .complete, time: .shortened)).
         """
 
         let image = selectedImage
         selectedImage = nil
-        sendToGemini(system: system, prompt: prompt, image: image, apiKey: apiKey) { result in
+        sendToGemini(system: system, prompt: prompt, image: image, history: history, apiKey: apiKey) { result in
             DispatchQueue.main.async {
                 isLoading = false
                 switch result {
                 case .success(let reply):
-                    messages.append(ChatMessage(role: "assistant", content: reply, image: nil))
+                    store.chat.append(ChatMessage(role: "assistant", content: reply, image: nil))
                 case .failure(let error):
-                    messages.append(ChatMessage(role: "assistant", content: "Sorry, I hit an error: \(error.localizedDescription)", image: nil))
+                    store.chat.append(ChatMessage(role: "assistant", content: "Sorry, I hit an error: \(error.localizedDescription)", image: nil))
                 }
             }
         }
@@ -2478,27 +2746,54 @@ struct MessageBubble: View {
     }
 }
 
-struct ChatMessage: Identifiable {
-    let id = UUID()
-    let role: String
-    let content: String
-    let image: UIImage?
+struct ChatMessage: Identifiable, Codable {
+    var id = UUID()
+    var role: String
+    var content: String
+    var imageFileName: String? = nil
+    var date = Date()
+
+    var image: UIImage? {
+        guard let imageFileName else { return nil }
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent(imageFileName)
+        return UIImage(contentsOfFile: url.path)
+    }
+
+    init(role: String, content: String, image: UIImage?) {
+        self.role = role
+        self.content = content
+        if let image, let resized = resizeImage(image, maxSide: 800), let data = resized.jpegData(compressionQuality: 0.7) {
+            let name = "chat-\(UUID().uuidString).jpg"
+            let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent(name)
+            try? data.write(to: url)
+            imageFileName = name
+        }
+    }
 }
 
 // MARK: - Gemini
 
-func sendToGemini(system: String, prompt: String, image: UIImage?, apiKey: String, jsonMode: Bool = false, completion: @escaping (Result<String, Error>) -> Void) {
-    var parts: [[String: Any]] = [["text": "\(system)\n\n\(prompt)"]]
+func sendToGemini(system: String, prompt: String, image: UIImage?, history: [ChatMessage] = [], apiKey: String, jsonMode: Bool = false, completion: @escaping (Result<String, Error>) -> Void) {
+    var parts: [[String: Any]] = [["text": prompt]]
 
     if let image = image, let resized = resizeImage(image, maxSide: 512), let data = resized.jpegData(compressionQuality: 0.6) {
         let base64 = data.base64EncodedString()
         parts.append(["inline_data": ["mime_type": "image/jpeg", "data": base64]])
     }
 
+    // Earlier turns go in as real conversation history so the model can remember them.
+    // Past photos are summarised as text to keep requests small.
+    var contents: [[String: Any]] = history
+        .filter { !$0.content.hasPrefix("Sorry, I hit an error") && !$0.content.hasPrefix("Please save your Gemini API key") }
+        .map { msg in
+            let text = msg.imageFileName == nil ? msg.content : "[photo attached] \(msg.content)"
+            return ["role": msg.role == "user" ? "user" : "model", "parts": [["text": text]]]
+        }
+    contents.append(["role": "user", "parts": parts])
+
     var body: [String: Any] = [
-        "contents": [
-            ["role": "user", "parts": parts]
-        ]
+        "systemInstruction": ["parts": [["text": system]]],
+        "contents": contents
     ]
     if jsonMode {
         body["generationConfig"] = ["responseMimeType": "application/json"]
@@ -2759,6 +3054,638 @@ struct ProgressChart: View {
     }
 }
 
+// MARK: - Physique (AI Body Fat & Projections)
+
+struct PhysiqueView: View {
+    @ObservedObject var store: Store
+    @AppStorage("geminiAPIKey") private var apiKey: String = ""
+    @State private var photoImage: UIImage?
+    @State private var photoFileName: String?
+    @State private var weightInput = ""
+    @State private var heightInput = ""
+    @State private var ageInput = ""
+    @State private var sex = "male"
+    @State private var estimating = false
+    @State private var estimateError: String?
+    @State private var scan: PhysiqueScan?
+    @State private var generating = false
+    @State private var generatingTarget: Double?
+    @State private var generateError: String?
+    @State private var selectedTarget: Double?
+    @State private var viewerStart: UUID?
+    @State private var previewPage = 0
+    @State private var sliderPosition: CGFloat = 0.5
+    @State private var showCompare = false
+
+    private var currentPhoto: UIImage? { photoImage }
+    private var availableTargets: [Double] {
+        guard let s = scan else { return [] }
+        var targets: [Double] = []
+        for bf in stride(from: Int(s.bodyFat) - 2, through: 8, by: -2) {
+            if bf >= 8 { targets.append(Double(bf)) }
+        }
+        return targets
+    }
+
+    private var previewItems: [(label: String, image: UIImage?, fileName: String?)] {
+        var items: [(String, UIImage?, String?)] = []
+        if let img = photoImage { items.append(("Current", img, photoFileName)) }
+        if let s = scan {
+            for (bf, fname) in s.generated.sorted(by: { Double($0.key) ?? 0 < Double($1.key) ?? 0 }) {
+                let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent(fname)
+                items.append(("AI preview · \(bf)% · \(targetWeight(for: Double(bf) ?? 0))", UIImage(contentsOfFile: url.path), fname))
+            }
+        }
+        return items
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 20) {
+                    heroCard
+                    photoCard
+                    if let s = scan { resultCard(s) }
+                    if let s = scan { planCard(s) }
+                    if let s = scan { compareCard(s) }
+                }
+                .padding()
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("Physique")
+            .navigationDestination(item: $viewerStart) { id in
+                PhotoViewer(store: store, logs: store.photoLogs, startID: id)
+            }
+            .keyboardDoneButton()
+            .onAppear { restoreLatestScan() }
+            .toolbar {
+                if scan != nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("New scan") {
+                            withAnimation(.snappy) { scan = nil; photoImage = nil; photoFileName = nil; selectedTarget = nil; generateError = nil }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var heroCard: some View {
+        HeroCard(gradient: Theme.weight) {
+            HStack {
+                Label("AI Body Fat", systemImage: "figure")
+                    .font(.headline.weight(.bold))
+                Spacer()
+                Text("Powered by Gemini")
+                    .font(.caption.weight(.semibold))
+                    .opacity(0.85)
+            }
+            .foregroundStyle(.white)
+        }
+    }
+
+    private var photoCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            SectionTitle(title: "Your Photo", icon: "camera.fill", color: Theme.weightColor)
+
+            if let img = photoImage {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(alignment: .topTrailing) {
+                        Button {
+                            photoImage = nil
+                            photoFileName = nil
+                            scan = nil
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.title2)
+                                .foregroundStyle(.white)
+                                .background(Circle().fill(.black.opacity(0.5)))
+                        }
+                        .padding(8)
+                    }
+            } else {
+                PhotoSourceButton(
+                    image: $photoImage,
+                    fileName: $photoFileName,
+                    recentLogs: store.photoLogs,
+                    onSelect: { img, fname in photoImage = img; photoFileName = fname }
+                )
+            }
+
+            HStack(spacing: 12) {
+                VStack(alignment: .leading) {
+                    TextField("Weight", text: $weightInput)
+                        .keyboardType(.decimalPad)
+                        .font(.subheadline.weight(.medium))
+                    Text(store.unit.title).font(.caption).foregroundStyle(.secondary)
+                }
+                .inputField()
+
+                VStack(alignment: .leading) {
+                    TextField("Height (cm, opt.)", text: $heightInput)
+                        .keyboardType(.decimalPad)
+                        .font(.subheadline.weight(.medium))
+                }
+                .inputField()
+
+                VStack(alignment: .leading) {
+                    TextField("Age (opt.)", text: $ageInput)
+                        .keyboardType(.numberPad)
+                        .font(.subheadline.weight(.medium))
+                }
+                .inputField()
+            }
+
+            Picker("Sex", selection: $sex) {
+                Text("Male").tag("male")
+                Text("Female").tag("female")
+            }
+            .pickerStyle(.segmented)
+
+            Button {
+                estimateBodyFat()
+            } label: {
+                HStack {
+                    if estimating { ProgressView().tint(.white) }
+                    Label("Estimate My Body Fat", systemImage: "sparkles")
+                }
+            }
+            .buttonStyle(GradientButtonStyle(gradient: Theme.weight))
+            .disabled(photoImage == nil || weightInput.isEmpty || estimating)
+
+            if let err = estimateError {
+                Label(err, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .card()
+    }
+
+    private func resultCard(_ s: PhysiqueScan) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionTitle(title: "Estimate", icon: "percent", color: Theme.weightColor)
+
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(String(format: "%.1f", s.bodyFat))
+                    .font(.system(size: 56, weight: .heavy, design: .rounded))
+                    .foregroundStyle(Theme.weightColor)
+                Text("%")
+                    .font(.title.weight(.bold))
+                    .foregroundStyle(Theme.weightColor)
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("likely range")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(String(format: "%.0f–%.0f%%", s.low, s.high))
+                        .font(.subheadline.weight(.bold))
+                }
+            }
+
+            HStack(spacing: 16) {
+                VStack(alignment: .leading) {
+                    Text("Weight").font(.caption).foregroundStyle(.secondary)
+                    Text(store.display(weightKg: s.weightKg)).font(.headline.weight(.semibold))
+                }
+                VStack(alignment: .leading) {
+                    Text("Lean Mass").font(.caption).foregroundStyle(.secondary)
+                    Text(String(format: "%.1f kg", s.weightKg * (1 - s.bodyFat / 100))).font(.headline.weight(.semibold))
+                }
+                VStack(alignment: .leading) {
+                    Text("Fat Mass").font(.caption).foregroundStyle(.secondary)
+                    Text(String(format: "%.1f kg", s.weightKg * s.bodyFat / 100)).font(.headline.weight(.semibold))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(s.summary)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            if !s.cues.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(s.cues, id: \.self) { cue in
+                        Label(cue, systemImage: "checkmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Button {
+                store.addBodyFat(date: Date(), percent: s.bodyFat)
+            } label: {
+                Label("Save to my body fat log", systemImage: "arrow.down.doc.fill")
+            }
+            .buttonStyle(.bordered)
+            .tint(Theme.weightColor)
+        }
+        .card()
+    }
+
+    private func planCard(_ s: PhysiqueScan) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionTitle(title: "Body Fat → Weight Plan", icon: "target", color: Theme.weightColor)
+
+            VStack(spacing: 0) {
+                ForEach(availableTargets, id: \.self) { bf in
+                    let targetKg = targetWeightKg(for: bf)
+                    let lossKg = s.weightKg - targetKg
+                    let weeks = lossKg / (s.weightKg * 0.0075)
+                    HStack {
+                        Text(String(format: "%.0f%%", bf))
+                            .font(.headline.weight(.bold))
+                            .frame(width: 40, alignment: .leading)
+                        Spacer()
+                        Text(store.display(weightKg: targetKg))
+                            .font(.subheadline.weight(.medium))
+                        Spacer()
+                        Text(String(format: "−%.1f kg", lossKg))
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.green)
+                        Spacer()
+                        Text(String(format: "~%.0f wks", weeks))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                    .onTapGesture { selectedTarget = bf }
+                    .background(selectedTarget == bf ? Theme.weightColor.opacity(0.08) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+        .card()
+    }
+
+    private func compareCard(_ s: PhysiqueScan) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionTitle(title: "Side by Side", icon: "rectangle.split.2x1", color: Theme.weightColor)
+
+            Text("Pick a body fat level, then Generate to see an AI photo of you at that level.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(availableTargets, id: \.self) { bf in
+                        let key = String(format: "%.0f", bf)
+                        let done = s.generated[key] != nil
+                        let active = selectedTarget == bf
+                        Button {
+                            withAnimation(.snappy) { selectedTarget = bf }
+                            UISelectionFeedbackGenerator().selectionChanged()
+                        } label: {
+                            HStack(spacing: 4) {
+                                if done { Image(systemName: "checkmark").font(.caption2.weight(.bold)) }
+                                if generating && generatingTarget == bf { ProgressView().controlSize(.mini) }
+                                Text("\(key)%").font(.subheadline.weight(.bold))
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .foregroundStyle(active ? .white : Theme.weightColor)
+                            .background(Capsule().fill(active ? AnyShapeStyle(Theme.weight) : AnyShapeStyle(Theme.weightColor.opacity(0.12))))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            if let err = generateError {
+                Label(err, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            if let bf = selectedTarget {
+                let hasImage = s.generated[String(format: "%.0f", bf)] != nil
+                if hasImage, let img = generatedImage(for: bf) {
+                    VStack(spacing: 8) {
+                        Picker("Mode", selection: $showCompare) {
+                            Text("Slider").tag(false)
+                            Text("Side by side").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+
+                        if showCompare {
+                            HStack(spacing: 8) {
+                                comparePane(photoImage ?? UIImage(), label: "Now · \(String(format: "%.0f", s.bodyFat))%")
+                                comparePane(img, label: "AI · \(String(format: "%.0f", bf))% · \(targetWeight(for: bf))")
+                            }
+                        } else {
+                            GeometryReader { geo in
+                                let w = geo.size.width
+                                ZStack(alignment: .leading) {
+                                    Image(uiImage: img).resizable().scaledToFill()
+                                        .frame(width: w, height: geo.size.height).clipped()
+                                    Image(uiImage: photoImage ?? UIImage()).resizable().scaledToFill()
+                                        .frame(width: w, height: geo.size.height).clipped()
+                                        .mask(alignment: .leading) { Rectangle().frame(width: w * sliderPosition) }
+                                    Rectangle().fill(.white).frame(width: 3)
+                                        .shadow(radius: 3)
+                                        .offset(x: w * sliderPosition - 1.5)
+                                    Circle().fill(.white).frame(width: 32, height: 32)
+                                        .overlay(Image(systemName: "arrow.left.and.right").font(.caption.weight(.bold)).foregroundStyle(.black))
+                                        .shadow(radius: 3)
+                                        .offset(x: w * sliderPosition - 16, y: 0)
+                                        .frame(maxHeight: .infinity, alignment: .center)
+                                }
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                                .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                                    sliderPosition = min(max(value.location.x / w, 0), 1)
+                                })
+                            }
+                            .aspectRatio(3/4, contentMode: .fit)
+
+                            HStack {
+                                Text("Now · \(String(format: "%.0f", s.bodyFat))%")
+                                Spacer()
+                                Text("Drag to compare")
+                                Spacer()
+                                Text("AI · \(String(format: "%.0f", bf))% · \(targetWeight(for: bf))")
+                            }
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        }
+
+                        HStack {
+                            Button { generateImage(for: bf) } label: {
+                                Label("Regenerate", systemImage: "arrow.clockwise")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(generating)
+                            Spacer()
+                            Text("~7¢ per image")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } else {
+                    if generating, let img = photoImage {
+                        Image(uiImage: img)
+                            .resizable()
+                            .scaledToFit()
+                            .blur(radius: 6)
+                            .overlay {
+                                VStack(spacing: 10) {
+                                    ProgressView().tint(.white).controlSize(.large)
+                                    Text("Sculpting \(String(format: "%.0f", bf))%…")
+                                        .font(.headline)
+                                        .foregroundStyle(.white)
+                                    Text("Usually 5–15 seconds")
+                                        .font(.caption)
+                                        .foregroundStyle(.white.opacity(0.8))
+                                }
+                                .padding()
+                                .background(RoundedRectangle(cornerRadius: 14).fill(.black.opacity(0.45)))
+                            }
+                            .frame(maxHeight: 300)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    } else {
+                        Button {
+                            generateImage(for: bf)
+                        } label: {
+                            Label("Generate \(String(format: "%.0f", bf))% Preview", systemImage: "wand.and.stars")
+                        }
+                        .buttonStyle(GradientButtonStyle(gradient: Theme.weight))
+                        .disabled(generating)
+                        Text("You at \(String(format: "%.0f", bf))% would weigh about \(targetWeight(for: bf)) \(store.unit.title). Costs about 7¢ (paid Gemini).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                Text("Tap a body fat level above to see your AI preview.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !s.generated.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Your AI previews")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(s.generated.keys.sorted(), id: \.self) { key in
+                                if let img = generatedImage(for: Double(key) ?? 0) {
+                                    Image(uiImage: img)
+                                        .resizable()
+                                        .scaledToFill()
+                                        .frame(width: 60, height: 60)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                        .overlay(selectedTarget == (Double(key) ?? 0) ? RoundedRectangle(cornerRadius: 8).stroke(Theme.weightColor, lineWidth: 2) : nil)
+                                        .onTapGesture { selectedTarget = Double(key) ?? 0 }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .card()
+    }
+
+    private func comparePane(_ img: UIImage, label: String) -> some View {
+        VStack(spacing: 6) {
+            Image(uiImage: img)
+                .resizable()
+                .scaledToFill()
+                .frame(maxWidth: .infinity)
+                .aspectRatio(3/4, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+    }
+
+    private func targetWeightKg(for bf: Double) -> Double {
+        guard let s = scan else { return 0 }
+        let leanKg = s.weightKg * (1 - s.bodyFat / 100)
+        return leanKg / (1 - bf / 100)
+    }
+
+    private func targetWeight(for bf: Double) -> String {
+        store.display(weightKg: targetWeightKg(for: bf))
+    }
+
+    private func generatedImage(for bf: Double) -> UIImage? {
+        guard let s = scan, let fname = s.generated[String(format: "%.0f", bf)] else { return nil }
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent(fname)
+        return UIImage(contentsOfFile: url.path)
+    }
+
+    private func estimateBodyFat() {
+        guard let img = photoImage, let weight = parseNumber(weightInput) else { return }
+        estimating = true
+        estimateError = nil
+
+        Task {
+            do {
+                let kg = store.unit == .lb ? weight / 2.20462262 : weight
+                let result = try await GeminiService.estimateBodyFat(
+                    image: img,
+                    weightKg: kg,
+                    sex: sex,
+                    age: Int(ageInput),
+                    heightCm: Double(heightInput),
+                    apiKey: apiKey
+                )
+
+                let fname = savePhoto(img)
+                let newScan = PhysiqueScan(
+                    id: UUID(),
+                    date: Date(),
+                    photoFileName: fname,
+                    weightKg: kg,
+                    sex: sex,
+                    bodyFat: result.bodyFat,
+                    low: result.low,
+                    high: result.high,
+                    summary: result.summary,
+                    cues: result.cues
+                )
+                store.scans.append(newScan)
+                withAnimation(.snappy) { scan = newScan; selectedTarget = availableTargetsFor(newScan).first }
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                estimating = false
+            } catch {
+                estimateError = error.localizedDescription
+                estimating = false
+            }
+        }
+    }
+
+    private func availableTargetsFor(_ s: PhysiqueScan) -> [Double] {
+        stride(from: Int(s.bodyFat) - 2, through: 8, by: -2).filter { $0 >= 8 }.map(Double.init)
+    }
+
+    private func generateImage(for bf: Double) {
+        guard let img = photoImage, let s = scan else { return }
+        generating = true
+        generatingTarget = bf
+        generateError = nil
+
+        Task {
+            do {
+                let result = try await GeminiService.generateBodyImage(
+                    image: img,
+                    currentBF: s.bodyFat,
+                    targetBF: bf,
+                    sex: sex,
+                    apiKey: apiKey
+                )
+
+                let fname = savePhoto(result)
+                var updated = s
+                updated.generated[String(format: "%.0f", bf)] = fname
+                withAnimation(.snappy) { scan = updated }
+                if let idx = store.scans.firstIndex(where: { $0.id == s.id }) { store.scans[idx] = updated } else { store.scans.append(updated) }
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } catch {
+                generateError = error.localizedDescription
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            }
+            generating = false
+            generatingTarget = nil
+        }
+    }
+
+    /// Restore the most recent scan (and its previews) when the tab opens.
+    private func restoreLatestScan() {
+        guard scan == nil, let latest = store.scans.last else { return }
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent(latest.photoFileName)
+        guard let img = UIImage(contentsOfFile: url.path) else { return }
+        photoImage = img
+        photoFileName = latest.photoFileName
+        sex = latest.sex
+        weightInput = store.display(weightKg: latest.weightKg)
+        scan = latest
+        selectedTarget = latest.generated.keys.compactMap(Double.init).max() ?? availableTargetsFor(latest).first
+    }
+
+    private func savePhoto(_ img: UIImage) -> String {
+        let name = "\(UUID().uuidString).jpg"
+        if let data = img.jpegData(compressionQuality: 0.85) {
+            let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent(name)
+            try? data.write(to: url)
+        }
+        return name
+    }
+}
+
+// MARK: - Photo Source Button
+
+struct PhotoSourceButton: View {
+    @Binding var image: UIImage?
+    @Binding var fileName: String?
+    let recentLogs: [WeightLog]
+    var onSelect: (UIImage, String?) -> Void
+    @State private var showPicker = false
+    @State private var showCamera = false
+    @State private var showRecent = false
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Button { showPicker = true } label: {
+                HStack {
+                    Image(systemName: "photo.on.rectangle.angled")
+                    Text("Choose Photo")
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.systemGray5)))
+            }
+            .buttonStyle(.plain)
+
+            HStack(spacing: 8) {
+                if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                    Button { showCamera = true } label: {
+                        Label("Take Photo", systemImage: "camera.fill")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                if !recentLogs.isEmpty {
+                    Button { showRecent = true } label: {
+                        Label("Recent", systemImage: "clock.fill")
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+        .sheet(isPresented: $showPicker) {
+            ImagePicker(image: $image, sourceType: .photoLibrary)
+        }
+        .fullScreenCover(isPresented: $showCamera) {
+            TimerCameraView(image: $image)
+        }
+        .confirmationDialog("Recent Photos", isPresented: $showRecent) {
+            ForEach(recentLogs.prefix(5)) { log in
+                if let name = log.photoFileName {
+                    Button("\(log.date.formatted(date: .abbreviated, time: .omitted))") {
+                        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent(name)
+                        if let img = UIImage(contentsOfFile: url.path) {
+                            image = img
+                            fileName = name
+                            onSelect(img, name)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Progress Photos (thumbnails, viewer, gallery)
 
 struct PhotoViewerStart: Identifiable {
@@ -2857,6 +3784,7 @@ struct PhotoViewer: View {
     @ObservedObject var store: Store
     let logs: [WeightLog]
     @State private var selection: UUID
+    @State private var currentAngle: String = "front"
     @State private var shareImages: [UIImage] = []
     @State private var showShare = false
     @Environment(\.dismiss) private var dismiss
@@ -2869,18 +3797,23 @@ struct PhotoViewer: View {
 
     private var current: WeightLog? { logs.first { $0.id == selection } }
     private var position: Int { (logs.firstIndex { $0.id == selection } ?? 0) + 1 }
+    private var availableAngles: [String] {
+        guard let current = current else { return [] }
+        var angles: [String] = []
+        if current.photoFileName != nil { angles.append("front") }
+        angles.append(contentsOf: current.additionalPhotos.keys)
+        return angles
+    }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            TabView(selection: $selection) {
-                ForEach(logs) { log in
-                    ZoomablePhoto(url: store.photoURL(for: log)).tag(log.id)
-                }
+            if let current, let url = store.photoURL(for: current, angle: currentAngle) {
+                ZoomablePhoto(url: url)
+            } else {
+                Color.black
             }
-            .tabViewStyle(.page(indexDisplayMode: .never))
-            .ignoresSafeArea()
 
             VStack {
                 HStack(alignment: .top) {
@@ -2900,7 +3833,7 @@ struct PhotoViewer: View {
                     }
                     Spacer()
                     viewerButton("square.and.arrow.up") {
-                        if let current, let url = store.photoURL(for: current), let image = UIImage(contentsOfFile: url.path) {
+                        if let current, let url = store.photoURL(for: current, angle: currentAngle), let image = UIImage(contentsOfFile: url.path) {
                             shareImages = [image]
                             showShare = true
                         }
@@ -2911,17 +3844,47 @@ struct PhotoViewer: View {
 
                 Spacer()
 
-                Text("\(position) of \(logs.count) · pinch or double-tap to zoom")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.8))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(.black.opacity(0.45)))
-                    .padding(.bottom, 12)
+                if availableAngles.count > 1 {
+                    Picker("Angle", selection: $currentAngle) {
+                        ForEach(availableAngles, id: \.self) { angle in
+                            Text(angle.capitalized).tag(angle)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+                }
+
+                HStack(spacing: 16) {
+                    if position > 1 {
+                        viewerButton("chevron.left") {
+                            if let idx = logs.firstIndex(where: { $0.id == selection }), idx > 0 {
+                                selection = logs[idx - 1].id
+                                currentAngle = "front"
+                            }
+                        }
+                    }
+                    Spacer()
+                    Text("\(position) of \(logs.count)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.8))
+                    Spacer()
+                    if position < logs.count {
+                        viewerButton("chevron.right") {
+                            if let idx = logs.firstIndex(where: { $0.id == selection }), idx < logs.count - 1 {
+                                selection = logs[idx + 1].id
+                                currentAngle = "front"
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.bottom, 12)
             }
         }
         .statusBarHidden()
         .sheet(isPresented: $showShare) { ShareSheet(items: shareImages) }
+        .onChange(of: selection) { _, _ in currentAngle = "front" }
     }
 
     private func viewerButton(_ icon: String, action: @escaping () -> Void) -> some View {
@@ -3377,6 +4340,147 @@ struct TimerCameraView: View {
     }
 }
 
+/// Camera for capturing front, back, and side photos.
+struct MultiAngleCameraView: View {
+    @Binding var images: [String: UIImage]
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var camera = CameraController()
+    @AppStorage("cameraTimerSeconds") private var timerSeconds = 5
+    @State private var countdown: Int?
+    @State private var countdownTask: Task<Void, Never>?
+    @State private var captured: UIImage?
+    @State private var flash = false
+    @State private var currentAngle: AngleStep = .front
+
+    enum AngleStep: String, CaseIterable, Identifiable {
+        case front, back, side
+        var id: String { rawValue }
+        var title: String { rawValue.capitalized }
+        var instruction: String {
+            switch self {
+            case .front: return "Face the camera directly"
+            case .back: return "Turn around fully"
+            case .side: return "Face sideways (profile view)"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .front: return "figure.stand"
+            case .back: return "figure.stand.reverse"
+            case .side: return "figure.stand.sidebar.left"
+            }
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if let captured {
+                Image(uiImage: captured).resizable().scaledToFit().ignoresSafeArea()
+                reviewControls
+            } else if camera.permissionDenied {
+                permissionMessage
+            } else {
+                CameraPreview(session: camera.session).ignoresSafeArea()
+                if let countdown {
+                    Text("\(countdown)").font(.system(size: 160, weight: .heavy, design: .rounded)).foregroundStyle(.white)
+                }
+                Color.white.opacity(flash ? 0.8 : 0).ignoresSafeArea().allowsHitTesting(false)
+                captureControls
+            }
+        }
+        .statusBarHidden()
+        .onAppear { camera.start() }
+        .onDisappear { countdownTask?.cancel(); camera.stop() }
+    }
+
+    private var captureControls: some View {
+        VStack {
+            HStack {
+                circleButton("xmark") { dismiss() }
+                Spacer()
+                HStack(spacing: 6) {
+                    ForEach(AngleStep.allCases) { step in
+                        let isCurrent = step == currentAngle, isDone = images[step.rawValue] != nil
+                        Circle().fill(isCurrent ? .white : (isDone ? Theme.weightColor : .white.opacity(0.3))).frame(width: 24, height: 24)
+                            .overlay(Group {
+                                if isDone { Image(systemName: "checkmark").font(.caption2.weight(.bold)).foregroundStyle(.white) }
+                            })
+                    }
+                }
+                Spacer()
+                circleButton("arrow.triangle.2.circlepath.camera") { camera.flip() }.disabled(countdown != nil)
+            }.padding(.horizontal).padding(.top, 8)
+            Spacer()
+            VStack(spacing: 12) {
+                Image(systemName: currentAngle.icon).font(.system(size: 48)).foregroundStyle(.white)
+                Text(currentAngle.title).font(.title2.weight(.heavy)).foregroundStyle(.white)
+                Text(currentAngle.instruction).font(.subheadline).foregroundStyle(.white.opacity(0.85))
+            }
+            Spacer()
+            Button { countdown == nil ? startCapture() : cancelCountdown() } label: {
+                ZStack {
+                    Circle().stroke(.white, lineWidth: 5).frame(width: 82, height: 82)
+                    if countdown == nil { Circle().fill(.white).frame(width: 66, height: 66) }
+                    else { RoundedRectangle(cornerRadius: 8).fill(.red).frame(width: 32, height: 32) }
+                }
+            }.padding(.bottom, 12)
+            Text(countdown == nil ? (timerSeconds == 0 ? "Tap to take photo" : "Tap to start \(timerSeconds)s timer") : "Tap to cancel").font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.85)).padding(.bottom, 24)
+        }
+    }
+
+    private var reviewControls: some View {
+        VStack {
+            Spacer()
+            HStack(spacing: 16) {
+                Button { captured = nil } label: { Label("Retake", systemImage: "arrow.counterclockwise").frame(maxWidth: .infinity).padding(.vertical, 14).background(Capsule().fill(.black.opacity(0.55))).foregroundStyle(.white) }
+                Button {
+                    images[currentAngle.rawValue] = captured
+                    if let idx = AngleStep.allCases.firstIndex(of: currentAngle), let next = AngleStep.allCases[idx + 1..<AngleStep.allCases.count].first(where: { images[$0.rawValue] == nil }) {
+                        currentAngle = next; captured = nil
+                    } else { dismiss() }
+                } label: {
+                    let allDone = AngleStep.allCases.allSatisfy { images[$0.rawValue] != nil }
+                    Label(allDone ? "Done" : "Next Angle", systemImage: allDone ? "checkmark" : "arrow.right").frame(maxWidth: .infinity).padding(.vertical, 14).background(Capsule().fill(Theme.weight)).foregroundStyle(.white)
+                }
+            }.font(.headline).padding(.horizontal).padding(.bottom, 24)
+        }
+    }
+
+    private var permissionMessage: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "camera.fill").font(.system(size: 40))
+            Text("Camera access is off for this app.").font(.headline)
+            Button("Open Settings") { if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } }.buttonStyle(.borderedProminent)
+            Button("Close") { dismiss() }
+        }.foregroundStyle(.white).padding()
+    }
+
+    private func circleButton(_ icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: icon).font(.headline).foregroundStyle(.white).frame(width: 44, height: 44).background(Circle().fill(.black.opacity(0.45))) }
+    }
+
+    private func startCapture() {
+        guard timerSeconds > 0 else { takePhoto(); return }
+        countdown = timerSeconds
+        countdownTask = Task {
+            for i in (1...timerSeconds).reversed() {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if !Task.isCancelled { countdown = i }
+            }
+            if !Task.isCancelled { countdown = nil; takePhoto() }
+        }
+    }
+
+    private func cancelCountdown() { countdownTask?.cancel(); countdown = nil }
+
+    private func takePhoto() {
+        flash = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { flash = false }
+        camera.capture { if let img = $0 { captured = img } }
+    }
+}
+
 // MARK: - Image Picker
 
 struct ImagePicker: UIViewControllerRepresentable {
@@ -3412,6 +4516,187 @@ struct ImagePicker: UIViewControllerRepresentable {
 
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
             picker.dismiss(animated: true)
+        }
+    }
+}
+
+// MARK: - Gemini API Service
+
+struct GeminiService {
+    private static let visionModels = [
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash"
+    ]
+    private static let imageModels = [
+        "gemini-nano-banana-2.1",
+        "gemini-3.1-flash-image",
+        "gemini-3.1-flash-lite-image"
+    ]
+
+    struct BodyFatResult {
+        let bodyFat: Double
+        let low: Double
+        let high: Double
+        let summary: String
+        let cues: [String]
+    }
+
+    static func estimateBodyFat(image: UIImage, weightKg: Double, sex: String, age: Int?, heightCm: Double?, apiKey: String) async throws -> BodyFatResult {
+        guard !apiKey.isEmpty else { throw GeminiError.noAPIKey }
+
+        let base64 = image.jpegData(compressionQuality: 0.7)?.base64EncodedString() ?? ""
+        var parts: [[String: Any]] = [
+            ["text": """
+            You are an expert fitness analyst. Estimate this person's body fat percentage.
+            Provide: bodyFat (number), low (number), high (number), summary (2-3 sentences), cues (array of 2-4 observations).
+            Person: \(sex), weight: \(String(format: "%.1f", weightKg)) kg\(age.map { ", age: \($0)" } ?? "")\(heightCm.map { ", height: \($0) cm" } ?? "")
+            Respond with ONLY valid JSON.
+            """],
+            ["inline_data": ["mime_type": "image/jpeg", "data": base64]]
+        ]
+
+        for model in visionModels {
+            do {
+                let result = try await callGemini(model: model, parts: parts, apiKey: apiKey)
+                if let json = parseJSON(result), let bf = json["bodyFat"] as? Double {
+                    let low = json["low"] as? Double ?? max(bf - 3, 5)
+                    let high = json["high"] as? Double ?? min(bf + 3, 50)
+                    let summary = json["summary"] as? String ?? "Estimate based on visual analysis."
+                    let cues = json["cues"] as? [String] ?? []
+                    return BodyFatResult(bodyFat: bf, low: low, high: high, summary: summary, cues: cues)
+                }
+            } catch { continue }
+        }
+        throw GeminiError.allFailed
+    }
+
+    static func generateBodyImage(image: UIImage, currentBF: Double, targetBF: Double, sex: String, apiKey: String) async throws -> UIImage {
+        guard !apiKey.isEmpty else { throw GeminiError.noAPIKey }
+
+        let source = resizeImage(image, maxSide: 1024) ?? image
+        let base64 = source.jpegData(compressionQuality: 0.85)?.base64EncodedString() ?? ""
+        let prompt = """
+        Edit this photo to show the same person at \(String(format: "%.0f", targetBF))% body fat (currently about \(String(format: "%.0f", currentBF))%).
+        Keep the face, identity, pose, clothing, background, lighting, camera angle and skin tone exactly the same.
+        Change only body composition: a leaner face and neck, smaller waist, flatter stomach, more visible muscle definition in arms, shoulders and torso, in proportion to the body fat drop.
+        Keep it realistic and natural for a \(sex) at \(String(format: "%.0f", targetBF))% body fat. Do not exaggerate muscle size or add new clothing.
+        Return only the edited photo.
+        """
+
+        // Interactions API (current Nano Banana endpoint); falls back through models on failure.
+        var lastError: Error = GeminiError.allFailed
+        for model in imageModels {
+            do {
+                return try await createImageInteraction(model: model, prompt: prompt, imageBase64: base64, apiKey: apiKey)
+            } catch {
+                lastError = error
+                if case GeminiError.billing = error { throw error }
+                if case GeminiError.blocked = error { throw error }
+            }
+        }
+        throw lastError
+    }
+
+    private static func createImageInteraction(model: String, prompt: String, imageBase64: String, apiKey: String) async throws -> UIImage {
+        var request = URLRequest(url: URL(string: "https://generativelanguage.googleapis.com/v1beta/interactions")!, timeoutInterval: 120)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "model": model,
+            "input": [
+                ["type": "text", "text": prompt],
+                ["type": "image", "mime_type": "image/jpeg", "data": imageBase64]
+            ]
+        ])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+
+        if status != 200 {
+            let message = ((json["error"] as? [String: Any])?["message"] as? String) ?? "HTTP \(status)"
+            if status == 429 || message.localizedCaseInsensitiveContains("quota") || message.localizedCaseInsensitiveContains("billing") {
+                throw GeminiError.billing(message)
+            }
+            throw GeminiError.server(message)
+        }
+
+        for step in json["steps"] as? [[String: Any]] ?? [] {
+            for block in step["content"] as? [[String: Any]] ?? [] {
+                if block["type"] as? String == "image", let b64 = block["data"] as? String,
+                   let imgData = Data(base64Encoded: b64), let img = UIImage(data: imgData) {
+                    return img
+                }
+            }
+        }
+        // No image came back: usually a safety refusal. Surface the model's text if it gave one.
+        let text = (json["steps"] as? [[String: Any]])?
+            .flatMap { $0["content"] as? [[String: Any]] ?? [] }
+            .compactMap { $0["text"] as? String }.joined(separator: " ") ?? ""
+        throw GeminiError.blocked(text)
+    }
+
+    private static func callGemini(model: String, parts: [[String: Any]], apiKey: String, expectImage: Bool = false) async throws -> String {
+        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "contents": [["parts": parts]],
+            "generationConfig": ["temperature": 0.4, "maxOutputTokens": 4096] as [String: Any]
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw GeminiError.httpError
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let candidates = json["candidates"] as? [[String: Any]],
+              let content = candidates.first?["content"] as? [String: Any],
+              let respParts = content["parts"] as? [[String: Any]] else {
+            throw GeminiError.parseError
+        }
+
+        for part in respParts {
+            if expectImage {
+                if let inline = part["inline_data"] as? [String: Any], let b64 = inline["data"] as? String {
+                    return b64
+                }
+            } else {
+                if let text = part["text"] as? String {
+                    return text
+                }
+            }
+        }
+        throw GeminiError.parseError
+    }
+
+    private static func parseJSON(_ text: String) -> [String: Any]? {
+        let cleaned = text.replacingOccurrences(of: "```json", with: "").replacingOccurrences(of: "```", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = cleaned.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return json
+    }
+
+    enum GeminiError: Error, LocalizedError {
+        case noAPIKey, httpError, parseError, allFailed
+        case billing(String), blocked(String), server(String)
+        var errorDescription: String? {
+            switch self {
+            case .noAPIKey: return "Add your Gemini API key in Mr Olympia first."
+            case .httpError: return "Network request failed. Check your connection."
+            case .parseError: return "Could not read AI response."
+            case .allFailed: return "AI service is currently unavailable. Try again later."
+            case .billing(let m): return "Image generation needs billing enabled on your Gemini key (Google AI Studio → Billing). \(m)"
+            case .blocked(let m): return m.isEmpty ? "Gemini declined to edit this photo (safety filter). Try a photo in a fitted shirt or sports top." : "Gemini didn't return an image: \(m)"
+            case .server(let m): return m
+            }
         }
     }
 }
