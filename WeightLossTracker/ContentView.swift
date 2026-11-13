@@ -273,14 +273,57 @@ class Store: ObservableObject {
     @Published var scans: [PhysiqueScan] = [] {
         didSet { persist(scans, scansKey) }
     }
-    /// Mr Olympia conversation, kept across app launches so the coach remembers past sessions.
-    @Published var chat: [ChatMessage] = [] {
-        didSet { persist(chat, chatKey) }
+    /// Current Mr Olympia session only; not saved, so each app launch starts a fresh chat.
+    @Published var chat: [ChatMessage] = []
+    /// Durable facts Mr Olympia has learned about the user (goals, preferences, injuries...), saved across launches.
+    @Published var coachMemory: [String] = [] {
+        didSet { persist(coachMemory, memoryKey) }
     }
+    /// Transcript saved by the old "keep the whole chat" version; distilled into memory once, then deleted.
+    private(set) var legacyChat: [ChatMessage] = []
 
     func clearChat() {
-        for msg in chat { if let name = msg.imageFileName { try? FileManager.default.removeItem(at: docDir.appendingPathComponent(name)) } }
+        removeChatImages(chat)
         chat = []
+    }
+
+    func discardLegacyChat() {
+        removeChatImages(legacyChat)
+        legacyChat = []
+        UserDefaults.standard.removeObject(forKey: chatKey)
+    }
+
+    private func removeChatImages(_ messages: [ChatMessage]) {
+        for msg in messages { if let name = msg.imageFileName { try? FileManager.default.removeItem(at: docDir.appendingPathComponent(name)) } }
+    }
+
+    /// Asks Gemini to fold a conversation snippet into the saved memory. Calls back with true on success.
+    func learn(from transcript: String, apiKey: String, completion: ((Bool) -> Void)? = nil) {
+        let current = coachMemory.isEmpty ? "(nothing yet)" : coachMemory.map { "- \($0)" }.joined(separator: "\n")
+        let system = """
+        You maintain the long-term memory of "Mr Olympia", a fitness coach inside a weight-loss app. \
+        Update the list of durable facts about the user from the conversation below. \
+        Keep: goals and motivations, preferences and dislikes (foods, training styles, how they like answers), injuries or limitations, \
+        schedule and lifestyle, equipment, diet habits, recurring questions or concerns, advice they adopted or rejected, and how their situation has changed. \
+        Skip: greetings, one-off chit-chat, and numbers the app already tracks (daily weight, calories, steps, waist, body fat logs). \
+        Keep existing facts unless the conversation contradicts or updates them; merge duplicates; when something changed, keep only the latest version. \
+        Each fact is one short sentence about "the user". Maximum 40 facts, most important first. \
+        Respond ONLY with JSON: {"memory": [string]}
+        """
+        let prompt = "Current memory:\n\(current)\n\nConversation:\n\(transcript)"
+        sendToGemini(system: system, prompt: prompt, image: nil, apiKey: apiKey, jsonMode: true) { result in
+            var facts: [String]?
+            if case .success(let text) = result, let data = text.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                facts = (obj["memory"] as? [String])?
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+            }
+            DispatchQueue.main.async {
+                if let facts { self.coachMemory = Array(facts.prefix(40)) }
+                completion?(facts != nil)
+            }
+        }
     }
     private let healthStore = HKHealthStore()
     @Published var calorieGoal: Int = 2000 {
@@ -304,6 +347,7 @@ class Store: ObservableObject {
     private let scansKey = "physiqueScans"
     private let healthFoodsKey = "healthFoodLogs"
     private let chatKey = "olympiaChat"
+    private let memoryKey = "olympiaMemory"
     private let docDir: URL
 
     init() {
@@ -318,7 +362,8 @@ class Store: ObservableObject {
         roadmap = load(roadmapKey)
         waist = load(waistKey) ?? []
         scans = load(scansKey) ?? []
-        chat = load(chatKey) ?? []
+        legacyChat = load(chatKey) ?? []
+        coachMemory = load(memoryKey) ?? []
         let savedStepGoal = UserDefaults.standard.integer(forKey: stepGoalKey)
         stepGoal = savedStepGoal > 0 ? savedStepGoal : 10000
         healthConnected = UserDefaults.standard.bool(forKey: healthKey)
@@ -2374,6 +2419,7 @@ struct MrOlympiaView: View {
     @State private var isLoading = false
     @State private var selectedImage: UIImage?
     @State private var showSourcePicker = false
+    @State private var showMemory = false
 
     private var messages: [ChatMessage] { store.chat }
 
@@ -2425,9 +2471,18 @@ struct MrOlympiaView: View {
                         Button {
                             withAnimation { store.clearChat() }
                         } label: {
-                            Image(systemName: "trash")
+                            Image(systemName: "square.and.pencil")
                         }
+                        .accessibilityLabel("New chat")
                     }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showMemory = true
+                    } label: {
+                        Image(systemName: "brain.head.profile")
+                    }
+                    .accessibilityLabel("What Mr Olympia knows about you")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -2439,7 +2494,11 @@ struct MrOlympiaView: View {
                 }
             }
             .tint(Theme.olympiaColor)
-            .onAppear { keyInput = apiKey }
+            .onAppear {
+                keyInput = apiKey
+                migrateLegacyChat()
+            }
+            .sheet(isPresented: $showMemory) { CoachMemoryView(store: store) }
             .photoSourcePicker(title: "Attach a photo", isPresented: $showSourcePicker, image: $selectedImage)
         }
     }
@@ -2591,6 +2650,20 @@ struct MrOlympiaView: View {
         .background(.bar)
     }
 
+    /// One-time: turn the transcript saved by the previous version into learned facts, then delete it.
+    private func migrateLegacyChat() {
+        guard !store.legacyChat.isEmpty, !apiKey.isEmpty else { return }
+        let transcript = store.legacyChat
+            .filter { !$0.content.hasPrefix("Sorry, I hit an error") && !$0.content.hasPrefix("Please save your Gemini API key") }
+            .suffix(80)
+            .map { "\($0.role == "user" ? "User" : "Coach"): \($0.content)" }
+            .joined(separator: "\n")
+        guard !transcript.isEmpty else { store.discardLegacyChat(); return }
+        store.learn(from: transcript, apiKey: apiKey) { ok in
+            if ok { store.discardLegacyChat() }
+        }
+    }
+
     private func performSend() {
         guard !apiKey.isEmpty else {
             store.chat.append(ChatMessage(role: "assistant", content: "Please save your Gemini API key first. Get a free one at aistudio.google.com/app/apikey", image: nil))
@@ -2599,8 +2672,8 @@ struct MrOlympiaView: View {
         }
 
         let prompt = input.isEmpty ? "What do you think of my physique and what should I improve?" : input
-        // Everything before this message is history the coach should remember.
-        let history = Array(store.chat.suffix(40))
+        // Earlier turns of this session only; long-term knowledge comes from coachMemory.
+        let history = Array(store.chat.suffix(20))
         store.chat.append(ChatMessage(role: "user", content: prompt, image: selectedImage))
         input = ""
         isLoading = true
@@ -2627,6 +2700,14 @@ struct MrOlympiaView: View {
         let roadmapText = store.roadmap.map {
             "Active roadmap: from \(String(format: "%.1f", $0.startWeight)) \($0.weightUnit) at \(String(format: "%.1f", $0.startBodyFat))% to \(String(format: "%.1f", $0.plan.goalWeight)) \($0.weightUnit) at \(String(format: "%.1f", $0.goalBodyFat))% over \($0.plan.totalWeeks) weeks; currently week \($0.currentWeek)."
         } ?? "No roadmap yet."
+        let memoryText = store.coachMemory.isEmpty
+            ? "You don't know much about this user's preferences yet; pay attention to what they tell you."
+            : """
+              What you've learned about this user from earlier conversations (you don't see those transcripts, only these notes). \
+              Tailor every answer to them: respect their preferences, limitations and goals, avoid suggestions they've rejected, and build on what they already do. \
+              Mention a remembered detail only when it's genuinely relevant, naturally, without saying 'according to my notes': \
+              \(store.coachMemory.map { "• \($0)" }.joined(separator: " "))
+              """
 
         let system = """
         You are "Mr Olympia", a supportive, motivating fitness, nutrition, and physique coach. The user uses \(unit). \
@@ -2638,9 +2719,8 @@ struct MrOlympiaView: View {
         \(roadmapText) \
         Give concise, encouraging, actionable advice using short bullet points. For calories and steps, provide reasonable estimates and explain. \
         Do not give medical diagnoses. \
-        Memory: this is an ongoing conversation that continues across days. The earlier messages are your shared history; remember what the user told you \
-        (goals, injuries, preferences, schedule, past advice you gave) and build on it. Refer back to it when relevant and notice progress or changes. \
-        Style: \(history.isEmpty ? "This is the very first message, so a brief one-line hello is fine." : "You are mid-conversation. Do NOT greet, reintroduce yourself, or open with 'Hey champ' or any stock opener.") \
+        \(memoryText) \
+        Style: \(history.isEmpty ? "This is the start of a new session. Do not use a stock greeting like 'Hey champ'; at most a few fresh words, then answer." : "You are mid-conversation. Do NOT greet or reintroduce yourself.") \
         Never start two replies the same way. Vary how you open: sometimes dive straight into the answer, sometimes react to what they said, sometimes ask a quick follow-up first. \
         Today is \(Date().formatted(date: .complete, time: .shortened)).
         """
@@ -2653,10 +2733,66 @@ struct MrOlympiaView: View {
                 switch result {
                 case .success(let reply):
                     store.chat.append(ChatMessage(role: "assistant", content: reply, image: nil))
+                    // Learn from this exchange in the background so future answers take it into account.
+                    store.learn(from: "User: \(prompt)\(image == nil ? "" : " [attached a photo]")\nCoach: \(reply)", apiKey: apiKey)
                 case .failure(let error):
                     store.chat.append(ChatMessage(role: "assistant", content: "Sorry, I hit an error: \(error.localizedDescription)", image: nil))
                 }
             }
+        }
+    }
+}
+
+/// Shows the facts Mr Olympia has learned, so the user can check and correct them.
+struct CoachMemoryView: View {
+    @ObservedObject var store: Store
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmForget = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    if store.coachMemory.isEmpty {
+                        Text("Nothing yet. As you chat, Mr Olympia picks up your goals, preferences, injuries and routine, and uses them in every answer.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(store.coachMemory, id: \.self) { fact in
+                            Label(fact, systemImage: "lightbulb.fill")
+                                .font(.subheadline)
+                                .labelStyle(MemoryLabelStyle())
+                        }
+                        .onDelete { store.coachMemory.remove(atOffsets: $0) }
+                    }
+                } footer: {
+                    Text("Learned from your questions and saved only on this iPhone. Swipe left on anything that's wrong or out of date to remove it.")
+                }
+
+                if !store.coachMemory.isEmpty {
+                    Section {
+                        Button("Forget everything", role: .destructive) { confirmForget = true }
+                    }
+                }
+            }
+            .navigationTitle("What I know about you")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
+            }
+            .confirmationDialog("Forget everything Mr Olympia has learned?", isPresented: $confirmForget, titleVisibility: .visible) {
+                Button("Forget everything", role: .destructive) { store.coachMemory = [] }
+            }
+        }
+        .tint(Theme.olympiaColor)
+    }
+}
+
+private struct MemoryLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            configuration.icon.foregroundStyle(Theme.olympiaColor).font(.caption).padding(.top, 3)
+            configuration.title
         }
     }
 }
